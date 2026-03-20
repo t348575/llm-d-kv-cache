@@ -22,10 +22,13 @@
 
 // Write a buffer to disk using a temporary file and atomic rename
 bool write_buffer_to_file(const StagingBufferInfo& buf,
-                          const std::string& target_path);
+                          const std::string& target_path,
+                          bool use_odirect = false);
 
 // Read a file into a thread-local staging buffer
-bool read_buffer_from_file(const std::string& path, StagingBufferInfo& buf);
+bool read_buffer_from_file(const std::string& path,
+                           StagingBufferInfo& buf,
+                           bool use_odirect = false);
 
 // update_atime update only the atime of a file without changing mtime
 void update_atime(const std::string& path);

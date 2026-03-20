@@ -55,12 +55,16 @@
 StorageOffloadEngine::StorageOffloadEngine(int io_threads,
                                            int gpu_blocks_per_file,
                                            std::vector<torch::Tensor>& tensors,
-                                           int read_preferring_workers)
+                                           int read_preferring_workers,
+                                           bool use_odirect)
     : m_tensor_copier(tensors, gpu_blocks_per_file),
       m_thread_pool(io_threads,
                     calc_staging_bytes(gpu_blocks_per_file, tensors),
                     get_device_id(),
-                    read_preferring_workers) {}
+                    read_preferring_workers),
+      m_use_odirect(use_odirect) {
+  FS_LOG_INFO("StorageOffloadEngine: use_odirect=" << (use_odirect ? "true" : "false"));
+}
 
 // Get current device (should be set by vLLM before calling this)
 int StorageOffloadEngine::get_device_id() {
@@ -87,10 +91,11 @@ size_t StorageOffloadEngine::calc_staging_bytes(
 // Status and job management
 // -------------------------------
 // Return finished jobs and their success status
-std::vector<std::pair<int, bool>> StorageOffloadEngine::get_finished() {
+std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t>>
+StorageOffloadEngine::get_finished() {
   std::lock_guard<std::mutex> lock(m_jobs_mutex);
 
-  std::vector<std::pair<int, bool>> results;
+  std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t>> results;
   std::vector<int> to_erase;
 
   // Iterate over all active jobs.
@@ -101,7 +106,12 @@ std::vector<std::pair<int, bool>> StorageOffloadEngine::get_finished() {
     // Check if the job has completed all its tasks.
     if (job_state->completed_tasks.load() == job_state->total_tasks) {
       bool all_ok = job_state->all_success.load();
-      results.emplace_back(job_id, all_ok);
+      results.emplace_back(
+          job_id,
+          job_state->all_success.load(),
+          job_state->num_bytes.load(),
+          job_state->cuda_copy_ns.load(),
+          job_state->file_io_ns.load());
       to_erase.push_back(job_id);
     }
   }
@@ -189,13 +199,14 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
           // Execute the copy operation
           try {
             // Stage 1: copy tensors from GPU to staging CPU tensor.
+            auto t0 = std::chrono::high_resolution_clock::now();
             TIME_EXPR(
                 "write phase 1: copy_blocks ",
                 m_tensor_copier.copy_blocks(cpu_base, block_ids, is_store),
                 "file: ",
                 dst_file);
             cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
-            job_state->completed_tasks.fetch_add(1);
+            auto t1 = std::chrono::high_resolution_clock::now();
 
             if (err != cudaSuccess) {
               FS_LOG_ERROR(
@@ -203,15 +214,23 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
               // job_state->all_success = false; // TODO- silent
               // ignore read failures for now offloading connector not able to
               // handle failures
+              job_state->completed_tasks.fetch_add(1);
               return false;
             }
             // Stage 2: Write the cpu tensor to disk.
             success = TIME_EXPR("write phase 2: write_buffer_to_file",
-                                write_buffer_to_file(buf, dst_file),
+                                write_buffer_to_file(buf, dst_file, m_use_odirect),
                                 "file:",
                                 dst_file,
                                 " size:",
                                 buf.size);
+            auto t2 = std::chrono::high_resolution_clock::now();
+            job_state->cuda_copy_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            job_state->file_io_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+            job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
+            job_state->completed_tasks.fetch_add(1);
             if (!success) {
               FS_LOG_ERROR("Store failed during file write: " << dst_file);
               return success;
@@ -267,10 +286,12 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
           try {
             // Stage 1: Read file to staging CPU tensor.
             // Read data from disk into a tensor.
+            auto t0 = std::chrono::high_resolution_clock::now();
             success = TIME_EXPR("read phase 1: read_buffer_from_file",
-                                read_buffer_from_file(src_file, buf),
+                                read_buffer_from_file(src_file, buf, m_use_odirect),
                                 "file:",
                                 src_file);
+            auto t1 = std::chrono::high_resolution_clock::now();
             if (!success) {
               FS_LOG_ERROR("Stage1 read_buffer_from_file failed for "
                            << src_file);
@@ -289,6 +310,12 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
 
             auto& tls_stream = ThreadPool::get_tls_stream();
             cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
+            auto t2 = std::chrono::high_resolution_clock::now();
+            job_state->file_io_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            job_state->cuda_copy_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+            job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
             if (err != cudaSuccess) {
               FS_LOG_ERROR(
                   "cudaStreamSynchronize failed: " << cudaGetErrorString(err));

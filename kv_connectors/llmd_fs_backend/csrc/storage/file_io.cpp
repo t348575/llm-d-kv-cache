@@ -35,62 +35,102 @@ namespace fs = std::filesystem;
 // Define a larger buffer (1MB) to reduce syscall overhead and speed up I/O
 const size_t WRITE_BUFFER_SIZE = 1 * 1024 * 1024;  // 1MB buffer
 
+// O_DIRECT alignment requirement (512 bytes covers all common block sizes)
+const size_t DIRECT_IO_ALIGN = 512;
+
 // Allocate custom I/O buffer for this thread (replaces small default buffer)
 thread_local std::vector<char> thread_write_buffer(WRITE_BUFFER_SIZE);
 
 // Thread-local unique suffix for temporary files
 thread_local std::string tmp_file_suffix =
     "_" + std::to_string(std::random_device{}()) + ".tmp";
+
+static inline size_t align_up(size_t n, size_t align) {
+  return (n + align - 1) & ~(align - 1);
+}
+
+static bool ensure_parent_dir(const std::string& path) {
+  fs::path parent_dir = fs::path(path).parent_path();
+  try {
+    fs::create_directories(parent_dir);
+    return true;
+  } catch (const fs::filesystem_error& e) {
+    FS_LOG_ERROR("Failed to create directories: " << e.what());
+    return false;
+  }
+}
+
 // -------------------------------------------------------------------
 // file-IO Functions
 // -------------------------------------------------------------------
 // Write a buffer to disk using a temporary file and atomic rename
 bool write_buffer_to_file(const StagingBufferInfo& buf,
-                          const std::string& target_path) {
-  // Create parent directory if needed
-  fs::path file_path(target_path);
-  fs::path parent_dir = file_path.parent_path();
-  try {
-    fs::create_directories(parent_dir);
-  } catch (const fs::filesystem_error& e) {
-    FS_LOG_ERROR("Failed to create directories: " << e.what());
-    return false;
-  }
+                          const std::string& target_path,
+                          bool use_odirect) {
+  if (!ensure_parent_dir(target_path)) return false;
 
-  // Write to a temporary file to ensure atomic replace on rename
-  // Include tmp_file_suffix so each thread uses a unique temporary file
   std::string tmp_path = target_path + tmp_file_suffix;
 
-  std::ofstream ofs(tmp_path, std::ios::out | std::ios::binary);
-  if (!ofs) {
-    FS_LOG_ERROR("Failed to open temporary file for writing: "
-                 << tmp_path << " - " << std::strerror(errno));
-    return false;
+  if (use_odirect) {
+    // O_DIRECT requires pointer and size to be aligned to DIRECT_IO_ALIGN
+    size_t write_size = align_up(buf.size, DIRECT_IO_ALIGN);
+    if (write_size > buf.size + DIRECT_IO_ALIGN) {
+      // Alignment added more than one block – something is very wrong.
+      FS_LOG_ERROR("O_DIRECT: buf.size " << buf.size << " requires unexpected padding");
+      return false;
+    }
+    if (reinterpret_cast<uintptr_t>(buf.ptr) % DIRECT_IO_ALIGN != 0) {
+      FS_LOG_ERROR("O_DIRECT: buf.ptr is not aligned to " << DIRECT_IO_ALIGN);
+      return false;
+    }
+
+    int fd = open(tmp_path.c_str(),
+                  O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT,
+                  0644);
+    if (fd < 0) {
+      FS_LOG_ERROR("O_DIRECT open for write failed: " << tmp_path
+                   << " - " << std::strerror(errno));
+      return false;
+    }
+
+    ssize_t written = write(fd, buf.ptr, write_size);
+    close(fd);
+
+    if (written != static_cast<ssize_t>(write_size)) {
+      FS_LOG_ERROR("O_DIRECT write failed: " << tmp_path
+                   << " (wrote " << written << "/" << write_size << " bytes)"
+                   << " - " << std::strerror(errno));
+      std::remove(tmp_path.c_str());
+      return false;
+    }
+  } else {
+    std::ofstream ofs(tmp_path, std::ios::out | std::ios::binary);
+    if (!ofs) {
+      FS_LOG_ERROR("Failed to open temporary file for writing: "
+                   << tmp_path << " - " << std::strerror(errno));
+      return false;
+    }
+
+    ofs.rdbuf()->pubsetbuf(thread_write_buffer.data(), WRITE_BUFFER_SIZE);
+    ofs.write(reinterpret_cast<const char*>(buf.ptr), buf.size);
+    if (!ofs) {
+      FS_LOG_ERROR("Failed to write to temporary file: " << tmp_path
+                   << " - " << std::strerror(errno));
+      std::remove(tmp_path.c_str());
+      return false;
+    }
+
+    ofs.flush();
+    if (!ofs) {
+      FS_LOG_ERROR("Failed to flush data to temporary file: "
+                   << tmp_path << " - " << std::strerror(errno));
+      return false;
+    }
   }
 
-  // Apply the custom buffer to the file stream
-  ofs.rdbuf()->pubsetbuf(thread_write_buffer.data(), WRITE_BUFFER_SIZE);
-
-  // Write file contents
-  ofs.write(reinterpret_cast<const char*>(buf.ptr), buf.size);
-  if (!ofs) {
-    FS_LOG_ERROR("Failed to write to temporary file: " << tmp_path << " - "
-                                                       << std::strerror(errno));
-    std::remove(tmp_path.c_str());  // Clean up temp file
-    return false;
-  }
-
-  ofs.flush();
-  if (!ofs) {
-    FS_LOG_ERROR("Failed to flush data to temporary file: "
-                 << tmp_path << " - " << std::strerror(errno));
-    return false;
-  }
-
-  // Atomically rename temp file to final target name after a successful write
   if (std::rename(tmp_path.c_str(), target_path.c_str()) != 0) {
     FS_LOG_ERROR("Failed to rename " << tmp_path << " to " << target_path
-                                     << " - " << std::strerror(errno));
+                 << " - " << std::strerror(errno));
     std::remove(tmp_path.c_str());
     return false;
   }

@@ -40,6 +40,10 @@ struct JobState {
   int total_tasks{0};
   // Flag indicating if all tasks succeeded
   std::atomic<bool> all_success{true};
+  // Per-phase timings accumulated across all tasks (nanoseconds)
+  std::atomic<int64_t> cuda_copy_ns{0};
+  std::atomic<int64_t> file_io_ns{0};
+  std::atomic<int64_t> num_bytes{0};
 };
 
 // StorageOffloadEngine class manages asynchronous storage offload operations
@@ -53,6 +57,8 @@ class StorageOffloadEngine {
   ThreadPool m_thread_pool;
   // Handles GPU <-> CPU tensor copy operations
   TensorCopier m_tensor_copier;
+  // Whether to use O_DIRECT (page-cache bypass) for file I/O
+  bool m_use_odirect;
   // Calculate staging buffer size in bytes
   static size_t calc_staging_bytes(int gpu_blocks_per_file,
                                    const std::vector<torch::Tensor>& tensors);
@@ -64,9 +70,10 @@ class StorageOffloadEngine {
   StorageOffloadEngine(int io_threads,
                        int gpu_blocks_per_file,
                        std::vector<torch::Tensor>& tensors,
-                       int read_preferring_workers);
-  // Return finished jobs and their success status
-  std::vector<std::pair<int, bool>> get_finished();
+                       int read_preferring_workers,
+                       bool use_odirect = false);
+  // Return finished jobs: (job_id, success, num_bytes, cuda_copy_ns, file_io_ns)
+  std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t>> get_finished();
   // Wait for all tasks in the specified job to complete
   void wait_job(int job_id);
   // Async GPU -> Storage transfer (PUT)

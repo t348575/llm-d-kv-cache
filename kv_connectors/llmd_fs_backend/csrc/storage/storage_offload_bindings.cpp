@@ -28,11 +28,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "StorageOffloadEngine",
       "Engine for asynchronous KV-cache offloading between GPU memory "
       "and shared storage using background I/O threads.")
-      .def(py::init<int, int, std::vector<torch::Tensor>&, int>(),
+      .def(py::init<int, int, std::vector<torch::Tensor>&, int, bool>(),
            py::arg("io_threads"),
            py::arg("gpu_blocks_per_file"),
            py::arg("tensors"),
            py::arg("read_preferring_workers"),
+           py::arg("use_odirect") = false,
            "Create a StorageOffloadEngine instance for asynchronous KV-cache "
            "transfers "
            "between GPU memory and shared storage. "
@@ -51,12 +52,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            "  tensors: List of GPU tensors backing the KV-cache.\n"
            "  read_preferring_workers: Number of workers that check "
            "read queue first (calculated as int(io_threads * read_ratio) "
-           "in Python).")
+           "in Python)..\n"
+           "  use_odirect: If True, open files with O_DIRECT to bypass the "
+           "page cache. Requires page-aligned staging buffers (guaranteed by "
+           "cudaHostAlloc) and transfer sizes that are multiples of 512 bytes "
+           "(guaranteed by KV cache geometry). Default: False.")
 
       .def("get_finished",
            &StorageOffloadEngine::get_finished,
-           "Return a list of finished job IDs and their success status.\n\n"
-           "Each entry is a (job_id, success) tuple.")
+           "Return a list of finished jobs with per-phase timing.\n\n"
+           "Each entry is a (job_id, success, num_bytes, cuda_copy_ns, file_io_ns) tuple.\n"
+           "  job_id: the job identifier\n"
+           "  success: True if all tasks succeeded\n"
+           "  num_bytes: total bytes transferred across all tasks\n"
+           "  cuda_copy_ns: total GPU<->CPU DMA time in nanoseconds\n"
+           "  file_io_ns: total file read/write time in nanoseconds")
 
       .def("async_store_gpu_blocks",
            &StorageOffloadEngine::async_store_gpu_blocks,
