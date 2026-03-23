@@ -14,9 +14,11 @@
 
 import math
 import os
+import time
 
 import storage_offload
 import torch
+from simple_profiler import profiler
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
@@ -50,6 +52,7 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
         gpu_blocks_per_file: int,
         file_mapper: FileMapper,
         engine: storage_offload.StorageOffloadEngine,
+        transfer_jobs: dict,
     ):
         """
         Initialize a SingleStorageDirectionOffloadingHandler.
@@ -58,10 +61,15 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
             gpu_blocks_per_file: Number of GPU blocks grouped into a single file.
             file_mapper: The FileMapper mapping blocks to files.
             engine: the storage engine.
+            transfer_jobs: Shared dict mapping job_id -> (wall_start_ns, profile_tid, req_id, direction).
+                           Must be shared between all handlers using the same engine so that
+                           whichever handler drains engine.get_finished() first can emit profiling
+                           for all job types.
         """
         self.file_mapper = file_mapper
         self.gpu_blocks_per_file = gpu_blocks_per_file
         self.engine = engine
+        self._transfer_jobs = transfer_jobs
 
     def get_finished(self) -> list[TransferResult]:
         """
@@ -71,10 +79,42 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
             List of completed transfer results.
         """
         finished_tuples = self.engine.get_finished()
-        return [
-            TransferResult(job_id=job_id, success=success)
-            for job_id, success in finished_tuples
-        ]
+        results = []
+        for job_id, success, num_bytes, cuda_copy_ns, file_io_ns in finished_tuples:
+            end_ns = time.perf_counter_ns()
+            job_meta = self._transfer_jobs.pop(job_id, None)
+            if job_meta is not None:
+                wall_start_ns, profile_tid, req_id, direction = job_meta
+                is_store = direction == "gpu_to_storage"
+                job_args = {"req_id": req_id, "success": success, "num_bytes": num_bytes}
+                profiler.add_event(
+                    name=f"fs_transfer({direction}, job={job_id})",
+                    category="fs_transfer",
+                    start_ns=wall_start_ns,
+                    duration_ns=end_ns - wall_start_ns,
+                    tid=profile_tid,
+                    args=job_args,
+                )
+                cuda_start_ns = wall_start_ns if is_store else wall_start_ns + file_io_ns
+                file_start_ns = wall_start_ns + cuda_copy_ns if is_store else wall_start_ns
+                profiler.add_event(
+                    name=f"cuda_staging({'gpu_to_cpu' if is_store else 'cpu_to_gpu'}, job={job_id})",
+                    category="cuda",
+                    start_ns=cuda_start_ns,
+                    duration_ns=cuda_copy_ns,
+                    tid=profile_tid,
+                    args={"req_id": req_id, "num_bytes": num_bytes},
+                )
+                profiler.add_event(
+                    name=f"file_{'write' if is_store else 'read'}(job={job_id})",
+                    category="fs",
+                    start_ns=file_start_ns,
+                    duration_ns=file_io_ns,
+                    tid=profile_tid,
+                    args={"req_id": req_id, "num_bytes": num_bytes},
+                )
+            results.append(TransferResult(job_id=job_id, success=success, transfer_size=num_bytes))
+        return results
 
     def wait(self, job_ids: set[int]):
         """
@@ -127,7 +167,8 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
 class GPUToStorageHandler(BaseStorageOffloadingHandler):
     """Handler for GPU -> Storage (PUT) transfers."""
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(self, job_id: int, spec: TransferSpec,
+                       profile_tid: str = "kv_store", req_id: str = "") -> bool:
         """
         Launch an asynchronous transfer GPU -> Storage.
 
@@ -148,14 +189,18 @@ class GPUToStorageHandler(BaseStorageOffloadingHandler):
             block_ids=src_spec.block_ids,
         )
 
-        # Submit async PUT transfer
-        return self.engine.async_store_gpu_blocks(job_id, dst_files, per_file_block_ids)
+        wall_start_ns = time.perf_counter_ns()
+        success = self.engine.async_store_gpu_blocks(job_id, dst_files, per_file_block_ids)
+        if success:
+            self._transfer_jobs[job_id] = (wall_start_ns, profile_tid, req_id, "gpu_to_storage")
+        return success
 
 
 class StorageToGPUHandler(BaseStorageOffloadingHandler):
     """Handler for asynchronous transfers from storage to GPU."""
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(self, job_id: int, spec: TransferSpec,
+                       profile_tid: str = "kv_load", req_id: str = "") -> bool:
         """
         Launch an asynchronous transfer Storage -> GPU.
 
@@ -176,8 +221,11 @@ class StorageToGPUHandler(BaseStorageOffloadingHandler):
             block_ids=dst_spec.block_ids,
         )
 
-        # Submit async GET transfer
-        return self.engine.async_load_gpu_blocks(job_id, src_files, per_file_block_ids)
+        wall_start_ns = time.perf_counter_ns()
+        success = self.engine.async_load_gpu_blocks(job_id, src_files, per_file_block_ids)
+        if success:
+            self._transfer_jobs[job_id] = (wall_start_ns, profile_tid, req_id, "storage_to_gpu")
+        return success
 
 
 class StorageOffloadingHandlers:
@@ -239,16 +287,22 @@ class StorageOffloadingHandlers:
             f"read_preferring_workers={read_preferring_workers}, "
         )
 
+        # Shared transfer_jobs dict so whichever handler drains engine.get_finished()
+        # first can emit profiling events for all job types (store and load).
+        shared_transfer_jobs: dict[int, tuple] = {}
+
         self.gpu_to_storage_handler = GPUToStorageHandler(
             engine=self.engine,
             file_mapper=file_mapper,
             gpu_blocks_per_file=gpu_blocks_per_file,
+            transfer_jobs=shared_transfer_jobs,
         )
 
         self.storage_to_gpu_handler = StorageToGPUHandler(
             engine=self.engine,
             file_mapper=file_mapper,
             gpu_blocks_per_file=gpu_blocks_per_file,
+            transfer_jobs=shared_transfer_jobs,
         )
 
     def _compute_buffer_size_mb(

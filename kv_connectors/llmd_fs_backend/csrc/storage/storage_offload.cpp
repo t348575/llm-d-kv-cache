@@ -51,6 +51,14 @@
 #include "tensor_copier.hpp"
 #include "logger.hpp"
 
+// Atomically store the maximum of the current value and `val`.
+static inline void atomic_fetch_max(std::atomic<int64_t>& a, int64_t val) {
+  int64_t current = a.load(std::memory_order_relaxed);
+  while (val > current && !a.compare_exchange_weak(current, val,
+                                                    std::memory_order_relaxed))
+    ;
+}
+
 // Initialize IO threads, CUDA streams, and staging memory pool
 StorageOffloadEngine::StorageOffloadEngine(int io_threads,
                                            int gpu_blocks_per_file,
@@ -225,9 +233,9 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
                                 " size:",
                                 buf.size);
             auto t2 = std::chrono::high_resolution_clock::now();
-            job_state->cuda_copy_ns.fetch_add(
+            atomic_fetch_max(job_state->cuda_copy_ns,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-            job_state->file_io_ns.fetch_add(
+            atomic_fetch_max(job_state->file_io_ns,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
             job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
             job_state->completed_tasks.fetch_add(1);
@@ -311,9 +319,9 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
             auto& tls_stream = ThreadPool::get_tls_stream();
             cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
             auto t2 = std::chrono::high_resolution_clock::now();
-            job_state->file_io_ns.fetch_add(
+            atomic_fetch_max(job_state->file_io_ns,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-            job_state->cuda_copy_ns.fetch_add(
+            atomic_fetch_max(job_state->cuda_copy_ns,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
             job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
             if (err != cudaSuccess) {

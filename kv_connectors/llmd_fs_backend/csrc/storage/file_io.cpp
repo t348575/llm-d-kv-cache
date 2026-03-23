@@ -139,8 +139,52 @@ bool write_buffer_to_file(const StagingBufferInfo& buf,
 }
 
 // Read a file into a thread-local staging buffer
-bool read_buffer_from_file(const std::string& path, StagingBufferInfo& buf) {
-  // Open file
+bool read_buffer_from_file(const std::string& path, StagingBufferInfo& buf, bool use_odirect) {
+  if (use_odirect) {
+    // Determine file size via stat (avoids opening with buffered IO first)
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+      FS_LOG_ERROR("O_DIRECT: stat failed: " << path << " - " << std::strerror(errno));
+      return false;
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
+
+    // O_DIRECT requires pointer and read size to be aligned to DIRECT_IO_ALIGN
+    if (reinterpret_cast<uintptr_t>(buf.ptr) % DIRECT_IO_ALIGN != 0) {
+      FS_LOG_ERROR("O_DIRECT: buf.ptr is not aligned to " << DIRECT_IO_ALIGN);
+      return false;
+    }
+    size_t read_size = align_up(file_size, DIRECT_IO_ALIGN);
+    if (!buf.ptr || buf.size < read_size) {
+      FS_LOG_ERROR("Staging buffer too small for O_DIRECT read: "
+                   << path << " (required=" << read_size
+                   << " available=" << buf.size << " ptr=" << buf.ptr << ")");
+      return false;
+    }
+
+    int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd < 0) {
+      FS_LOG_ERROR("O_DIRECT open for read failed: " << path
+                   << " - " << std::strerror(errno));
+      return false;
+    }
+
+    ssize_t bytes_read = read(fd, buf.ptr, read_size);
+    close(fd);
+
+    if (bytes_read < static_cast<ssize_t>(file_size)) {
+      FS_LOG_ERROR("O_DIRECT read failed: " << path
+                   << " (read " << bytes_read << "/" << file_size << " bytes)"
+                   << " - " << std::strerror(errno));
+      return false;
+    }
+
+    // Only file_size bytes are valid; caller must not rely on padding bytes
+    buf.size = file_size;
+    return true;
+  }
+
+  // Open files
   std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
   if (!ifs) {
     FS_LOG_ERROR("Failed to open file: " << path);
