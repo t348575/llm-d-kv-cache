@@ -80,13 +80,27 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
         """
         finished_tuples = self.engine.get_finished()
         results = []
-        for job_id, success, num_bytes, cuda_copy_ns, file_io_ns in finished_tuples:
+        for (job_id, success, num_bytes, cuda_copy_ns, file_io_ns,
+             file_io_wall_ns, cuda_copy_wall_ns) in finished_tuples:
             end_ns = time.perf_counter_ns()
             job_meta = self._transfer_jobs.pop(job_id, None)
             if job_meta is not None:
                 wall_start_ns, profile_tid, req_id, direction = job_meta
                 is_store = direction == "gpu_to_storage"
-                job_args = {"req_id": req_id, "success": success, "num_bytes": num_bytes}
+                # Compute bandwidth from wall-clock span
+                file_io_bw_gbps = (
+                    (num_bytes / file_io_wall_ns) if file_io_wall_ns > 0 else 0.0
+                )
+                cuda_copy_bw_gbps = (
+                    (num_bytes / cuda_copy_wall_ns) if cuda_copy_wall_ns > 0 else 0.0
+                )
+                job_args = {
+                    "req_id": req_id,
+                    "success": success,
+                    "num_bytes": num_bytes,
+                    "file_io_bw_GBps": round(file_io_bw_gbps, 3),
+                    "cuda_copy_bw_GBps": round(cuda_copy_bw_gbps, 3),
+                }
                 profiler.add_event(
                     name=f"fs_transfer({direction}, job={job_id})",
                     category="fs_transfer",
@@ -95,23 +109,25 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
                     tid=profile_tid,
                     args=job_args,
                 )
-                cuda_start_ns = wall_start_ns if is_store else wall_start_ns + file_io_ns
-                file_start_ns = wall_start_ns + cuda_copy_ns if is_store else wall_start_ns
+                cuda_start_ns = wall_start_ns if is_store else wall_start_ns + file_io_wall_ns
+                file_start_ns = wall_start_ns + cuda_copy_wall_ns if is_store else wall_start_ns
                 profiler.add_event(
                     name=f"cuda_staging({'gpu_to_cpu' if is_store else 'cpu_to_gpu'}, job={job_id})",
                     category="cuda",
                     start_ns=cuda_start_ns,
-                    duration_ns=cuda_copy_ns,
+                    duration_ns=cuda_copy_wall_ns,
                     tid=profile_tid,
-                    args={"req_id": req_id, "num_bytes": num_bytes},
+                    args={"req_id": req_id, "num_bytes": num_bytes,
+                          "bw_GBps": round(cuda_copy_bw_gbps, 3)},
                 )
                 profiler.add_event(
                     name=f"file_{'write' if is_store else 'read'}(job={job_id})",
                     category="fs",
                     start_ns=file_start_ns,
-                    duration_ns=file_io_ns,
+                    duration_ns=file_io_wall_ns,
                     tid=profile_tid,
-                    args={"req_id": req_id, "num_bytes": num_bytes},
+                    args={"req_id": req_id, "num_bytes": num_bytes,
+                          "bw_GBps": round(file_io_bw_gbps, 3)},
                 )
             results.append(TransferResult(job_id=job_id, success=success, transfer_size=num_bytes))
         return results
@@ -241,6 +257,7 @@ class StorageOffloadingHandlers:
         threads_per_gpu: int,
         max_staging_memory_gb: int = DEFAULT_MAX_STAGING_MEMORY_GB,
         read_preferring_ratio: float = DEFAULT_READ_PREFERRING_WORKERS_RATIO,
+        use_odirect: bool = False,
     ):
         threads_per_gpu = min(threads_per_gpu, int(os.cpu_count()))
         tensors, kernel_block_size = StorageOffloadingHandlers._get_tensors(
@@ -276,6 +293,7 @@ class StorageOffloadingHandlers:
             gpu_blocks_per_file=gpu_blocks_per_file,
             tensors=tensors,
             read_preferring_workers=read_preferring_workers,
+            use_odirect=use_odirect,
         )
 
         logger.info(
@@ -285,6 +303,7 @@ class StorageOffloadingHandlers:
             f"staging_buffer_size_mb={buffer_size_mb}, "
             f"max_staging_memory_gb={max_staging_memory_gb}, "
             f"read_preferring_workers={read_preferring_workers}, "
+            f"use_odirect={use_odirect}, "
         )
 
         # Shared transfer_jobs dict so whichever handler drains engine.get_finished()

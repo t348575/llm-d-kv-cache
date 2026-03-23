@@ -63,6 +63,9 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         self.offloaded_block_size = int(
             self.extra_config.get("block_size", DEFAULT_STORAGE_BLOCK_SIZE)
         )
+        self.use_odirect = bool(
+            self.extra_config.get("use_odirect", False)
+        )
 
         assert self.offloaded_block_size % self.gpu_block_size == 0, (
             "offloaded_block_size must be a multiple of gpu_block_size"
@@ -115,6 +118,7 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
                 kv_caches=kv_caches,
                 threads_per_gpu=self.threads_per_gpu,
                 max_staging_memory_gb=self.max_staging_memory_gb,
+                use_odirect=self.use_odirect,
             )
 
         assert self._handlers is not None

@@ -59,6 +59,14 @@ static inline void atomic_fetch_max(std::atomic<int64_t>& a, int64_t val) {
     ;
 }
 
+// Atomically store the minimum of the current value and `val`.
+static inline void atomic_fetch_min(std::atomic<int64_t>& a, int64_t val) {
+  int64_t current = a.load(std::memory_order_relaxed);
+  while (val < current && !a.compare_exchange_weak(current, val,
+                                                    std::memory_order_relaxed))
+    ;
+}
+
 // Initialize IO threads, CUDA streams, and staging memory pool
 StorageOffloadEngine::StorageOffloadEngine(int io_threads,
                                            int gpu_blocks_per_file,
@@ -99,11 +107,13 @@ size_t StorageOffloadEngine::calc_staging_bytes(
 // Status and job management
 // -------------------------------
 // Return finished jobs and their success status
-std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t>>
+std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t,
+                       int64_t, int64_t>>
 StorageOffloadEngine::get_finished() {
   std::lock_guard<std::mutex> lock(m_jobs_mutex);
 
-  std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t>> results;
+  std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t,
+                         int64_t, int64_t>> results;
   std::vector<int> to_erase;
 
   // Iterate over all active jobs.
@@ -113,13 +123,20 @@ StorageOffloadEngine::get_finished() {
 
     // Check if the job has completed all its tasks.
     if (job_state->completed_tasks.load() == job_state->total_tasks) {
-      bool all_ok = job_state->all_success.load();
+      int64_t fio_start = job_state->file_io_wall_start_ns.load();
+      int64_t fio_end = job_state->file_io_wall_end_ns.load();
+      int64_t cuda_start = job_state->cuda_copy_wall_start_ns.load();
+      int64_t cuda_end = job_state->cuda_copy_wall_end_ns.load();
+      int64_t file_io_wall_ns = (fio_end > fio_start) ? (fio_end - fio_start) : 0;
+      int64_t cuda_copy_wall_ns = (cuda_end > cuda_start) ? (cuda_end - cuda_start) : 0;
       results.emplace_back(
           job_id,
           job_state->all_success.load(),
           job_state->num_bytes.load(),
           job_state->cuda_copy_ns.load(),
-          job_state->file_io_ns.load());
+          job_state->file_io_ns.load(),
+          file_io_wall_ns,
+          cuda_copy_wall_ns);
       to_erase.push_back(job_id);
     }
   }
@@ -207,14 +224,14 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
           // Execute the copy operation
           try {
             // Stage 1: copy tensors from GPU to staging CPU tensor.
-            auto t0 = std::chrono::high_resolution_clock::now();
+            auto t0 = std::chrono::steady_clock::now();
             TIME_EXPR(
                 "write phase 1: copy_blocks ",
                 m_tensor_copier.copy_blocks(cpu_base, block_ids, is_store),
                 "file: ",
                 dst_file);
             cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
-            auto t1 = std::chrono::high_resolution_clock::now();
+            auto t1 = std::chrono::steady_clock::now();
 
             if (err != cudaSuccess) {
               FS_LOG_ERROR(
@@ -232,11 +249,17 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
                                 dst_file,
                                 " size:",
                                 buf.size);
-            auto t2 = std::chrono::high_resolution_clock::now();
-            atomic_fetch_max(job_state->cuda_copy_ns,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-            atomic_fetch_max(job_state->file_io_ns,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+            auto t2 = std::chrono::steady_clock::now();
+            auto t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+            auto t1_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count();
+            auto t2_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2.time_since_epoch()).count();
+            atomic_fetch_max(job_state->cuda_copy_ns, t1_ns - t0_ns);
+            atomic_fetch_max(job_state->file_io_ns, t2_ns - t1_ns);
+            // Wall-clock spans for bandwidth calculation
+            atomic_fetch_min(job_state->cuda_copy_wall_start_ns, t0_ns);
+            atomic_fetch_max(job_state->cuda_copy_wall_end_ns, t1_ns);
+            atomic_fetch_min(job_state->file_io_wall_start_ns, t1_ns);
+            atomic_fetch_max(job_state->file_io_wall_end_ns, t2_ns);
             job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
             job_state->completed_tasks.fetch_add(1);
             if (!success) {
@@ -294,12 +317,12 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
           try {
             // Stage 1: Read file to staging CPU tensor.
             // Read data from disk into a tensor.
-            auto t0 = std::chrono::high_resolution_clock::now();
+            auto t0 = std::chrono::steady_clock::now();
             success = TIME_EXPR("read phase 1: read_buffer_from_file",
                                 read_buffer_from_file(src_file, buf, m_use_odirect),
                                 "file:",
                                 src_file);
-            auto t1 = std::chrono::high_resolution_clock::now();
+            auto t1 = std::chrono::steady_clock::now();
             if (!success) {
               FS_LOG_ERROR("Stage1 read_buffer_from_file failed for "
                            << src_file);
@@ -318,11 +341,17 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
 
             auto& tls_stream = ThreadPool::get_tls_stream();
             cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
-            auto t2 = std::chrono::high_resolution_clock::now();
-            atomic_fetch_max(job_state->file_io_ns,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-            atomic_fetch_max(job_state->cuda_copy_ns,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+            auto t2 = std::chrono::steady_clock::now();
+            auto t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
+            auto t1_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count();
+            auto t2_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2.time_since_epoch()).count();
+            atomic_fetch_max(job_state->file_io_ns, t1_ns - t0_ns);
+            atomic_fetch_max(job_state->cuda_copy_ns, t2_ns - t1_ns);
+            // Wall-clock spans for bandwidth calculation
+            atomic_fetch_min(job_state->file_io_wall_start_ns, t0_ns);
+            atomic_fetch_max(job_state->file_io_wall_end_ns, t1_ns);
+            atomic_fetch_min(job_state->cuda_copy_wall_start_ns, t1_ns);
+            atomic_fetch_max(job_state->cuda_copy_wall_end_ns, t2_ns);
             job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
             if (err != cudaSuccess) {
               FS_LOG_ERROR(
