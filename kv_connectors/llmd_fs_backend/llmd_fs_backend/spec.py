@@ -67,10 +67,19 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
             self.extra_config.get("use_odirect", False)
         )
 
-        assert self.offloaded_block_size % self.gpu_block_size == 0, (
+        # gpu_block_size is a tuple (one per KV cache group); all groups must
+        # have the same block size for shared-storage offloading.
+        gpu_block_sizes = set(self.gpu_block_size)
+        assert len(gpu_block_sizes) == 1, (
+            "SharedStorageOffloadingSpec requires all KV cache groups to have "
+            "the same GPU block size"
+        )
+        self._single_gpu_block_size: int = gpu_block_sizes.pop()
+
+        assert self.offloaded_block_size % self._single_gpu_block_size == 0, (
             "offloaded_block_size must be a multiple of gpu_block_size"
         )
-        self.gpu_blocks_per_file = self.offloaded_block_size // self.gpu_block_size
+        self.gpu_blocks_per_file = self.offloaded_block_size // self._single_gpu_block_size
 
         self.read_preferring_ratio = float(
             self.extra_config.get(
@@ -89,7 +98,7 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         self.file_mapper = FileMapper(
             root_dir=shared_storage_path,
             model_name=vllm_config.model_config.model,
-            gpu_block_size=self.gpu_block_size,
+            gpu_block_size=self._single_gpu_block_size,
             gpu_blocks_per_file=self.gpu_blocks_per_file,
             tp_size=tp_size,
             pp_size=pp_size,
@@ -113,7 +122,7 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
             self._handlers = StorageOffloadingHandlers(
                 file_mapper=self.file_mapper,
                 gpu_blocks_per_file=self.gpu_blocks_per_file,
-                gpu_block_size=self.gpu_block_size,
+                gpu_block_size=self._single_gpu_block_size,
                 attn_backends=attn_backends,
                 kv_caches=kv_caches,
                 threads_per_gpu=self.threads_per_gpu,
