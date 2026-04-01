@@ -80,6 +80,7 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
             "offloaded_block_size must be a multiple of gpu_block_size"
         )
         self.gpu_blocks_per_file = self.offloaded_block_size // self._single_gpu_block_size
+        self.block_size_factor = self.gpu_blocks_per_file
 
         self.read_preferring_ratio = float(
             self.extra_config.get(
