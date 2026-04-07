@@ -24,11 +24,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "thread_pool.hpp"
 #include "tensor_copier.hpp"
+
+using PhaseSample = std::tuple<int64_t, int64_t, int64_t>;
 
 // Tracks progress and results for a multi-file async PUT/GET job
 struct JobState {
@@ -40,18 +43,11 @@ struct JobState {
   int total_tasks{0};
   // Flag indicating if all tasks succeeded
   std::atomic<bool> all_success{true};
-  // Per-phase timings: max across all tasks (nanoseconds)
-  std::atomic<int64_t> cuda_copy_ns{0};
-  std::atomic<int64_t> file_io_ns{0};
   std::atomic<int64_t> num_bytes{0};
-  // Wall-clock span of file I/O across all parallel tasks (nanoseconds since
-  // epoch). Used to compute aggregate I/O bandwidth:
-  //   bandwidth = num_bytes / (file_io_wall_end_ns - file_io_wall_start_ns)
-  std::atomic<int64_t> file_io_wall_start_ns{INT64_MAX};
-  std::atomic<int64_t> file_io_wall_end_ns{0};
-  // Wall-clock span of CUDA staging copies across all parallel tasks
-  std::atomic<int64_t> cuda_copy_wall_start_ns{INT64_MAX};
-  std::atomic<int64_t> cuda_copy_wall_end_ns{0};
+  // Per-task phase timing samples as (start_ns, duration_ns, num_bytes).
+  std::mutex samples_mutex;
+  std::vector<PhaseSample> file_io_samples;
+  std::vector<PhaseSample> cuda_copy_samples;
 };
 
 // StorageOffloadEngine class manages asynchronous storage offload operations
@@ -81,10 +77,10 @@ class StorageOffloadEngine {
                        int read_preferring_workers,
                        bool use_odirect = false);
   // Return finished jobs:
-  // (job_id, success, num_bytes, cuda_copy_ns, file_io_ns,
-  //  file_io_wall_ns, cuda_copy_wall_ns)
-  std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t,
-                         int64_t, int64_t>> get_finished();
+  // (job_id, success, num_bytes, file_io_samples, cuda_copy_samples)
+  std::vector<std::tuple<int, bool, int64_t,
+                         std::vector<PhaseSample>,
+                         std::vector<PhaseSample>>> get_finished();
   // Wait for all tasks in the specified job to complete
   void wait_job(int job_id);
   // Async GPU -> Storage transfer (PUT)

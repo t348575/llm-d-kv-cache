@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <future>
 #include <mutex>
@@ -50,22 +51,6 @@
 #include "thread_pool.hpp"
 #include "tensor_copier.hpp"
 #include "logger.hpp"
-
-// Atomically store the maximum of the current value and `val`.
-static inline void atomic_fetch_max(std::atomic<int64_t>& a, int64_t val) {
-  int64_t current = a.load(std::memory_order_relaxed);
-  while (val > current && !a.compare_exchange_weak(current, val,
-                                                    std::memory_order_relaxed))
-    ;
-}
-
-// Atomically store the minimum of the current value and `val`.
-static inline void atomic_fetch_min(std::atomic<int64_t>& a, int64_t val) {
-  int64_t current = a.load(std::memory_order_relaxed);
-  while (val < current && !a.compare_exchange_weak(current, val,
-                                                    std::memory_order_relaxed))
-    ;
-}
 
 // Initialize IO threads, CUDA streams, and staging memory pool
 StorageOffloadEngine::StorageOffloadEngine(int io_threads,
@@ -107,13 +92,15 @@ size_t StorageOffloadEngine::calc_staging_bytes(
 // Status and job management
 // -------------------------------
 // Return finished jobs and their success status
-std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t,
-                       int64_t, int64_t>>
+std::vector<std::tuple<int, bool, int64_t,
+                       std::vector<PhaseSample>,
+                       std::vector<PhaseSample>>>
 StorageOffloadEngine::get_finished() {
   std::lock_guard<std::mutex> lock(m_jobs_mutex);
 
-  std::vector<std::tuple<int, bool, int64_t, int64_t, int64_t,
-                         int64_t, int64_t>> results;
+  std::vector<std::tuple<int, bool, int64_t,
+                         std::vector<PhaseSample>,
+                         std::vector<PhaseSample>>> results;
   std::vector<int> to_erase;
 
   // Iterate over all active jobs.
@@ -123,20 +110,12 @@ StorageOffloadEngine::get_finished() {
 
     // Check if the job has completed all its tasks.
     if (job_state->completed_tasks.load() == job_state->total_tasks) {
-      int64_t fio_start = job_state->file_io_wall_start_ns.load();
-      int64_t fio_end = job_state->file_io_wall_end_ns.load();
-      int64_t cuda_start = job_state->cuda_copy_wall_start_ns.load();
-      int64_t cuda_end = job_state->cuda_copy_wall_end_ns.load();
-      int64_t file_io_wall_ns = (fio_end > fio_start) ? (fio_end - fio_start) : 0;
-      int64_t cuda_copy_wall_ns = (cuda_end > cuda_start) ? (cuda_end - cuda_start) : 0;
       results.emplace_back(
           job_id,
           job_state->all_success.load(),
           job_state->num_bytes.load(),
-          job_state->cuda_copy_ns.load(),
-          job_state->file_io_ns.load(),
-          file_io_wall_ns,
-          cuda_copy_wall_ns);
+          std::move(job_state->file_io_samples),
+          std::move(job_state->cuda_copy_samples));
       to_erase.push_back(job_id);
     }
   }
@@ -224,13 +203,27 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
           // Execute the copy operation
           try {
             // Stage 1: copy tensors from GPU to staging CPU tensor.
-            auto t0 = std::chrono::steady_clock::now();
+            cudaEvent_t copy_start_event = nullptr;
+            cudaEvent_t copy_end_event = nullptr;
+            ScopeGuard destroy_copy_events([&]() {
+              if (copy_start_event != nullptr) cudaEventDestroy(copy_start_event);
+              if (copy_end_event != nullptr) cudaEventDestroy(copy_end_event);
+            });
+
+            cudaError_t err = cudaEventCreate(&copy_start_event);
+            TORCH_CHECK(err == cudaSuccess, "cudaEventCreate failed");
+            err = cudaEventCreate(&copy_end_event);
+            TORCH_CHECK(err == cudaSuccess, "cudaEventCreate failed");
+            err = cudaEventRecord(copy_start_event, tls_stream.stream());
+            TORCH_CHECK(err == cudaSuccess, "cudaEventRecord failed");
             TIME_EXPR(
                 "write phase 1: copy_blocks ",
                 m_tensor_copier.copy_blocks(cpu_base, block_ids, is_store),
                 "file: ",
                 dst_file);
-            cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
+            err = cudaEventRecord(copy_end_event, tls_stream.stream());
+            TORCH_CHECK(err == cudaSuccess, "cudaEventRecord failed");
+            err = cudaStreamSynchronize(tls_stream.stream());
             auto t1 = std::chrono::steady_clock::now();
 
             if (err != cudaSuccess) {
@@ -250,17 +243,23 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
                                 " size:",
                                 buf.size);
             auto t2 = std::chrono::steady_clock::now();
-            auto t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
             auto t1_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count();
             auto t2_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2.time_since_epoch()).count();
-            atomic_fetch_max(job_state->cuda_copy_ns, t1_ns - t0_ns);
-            atomic_fetch_max(job_state->file_io_ns, t2_ns - t1_ns);
-            // Wall-clock spans for bandwidth calculation
-            atomic_fetch_min(job_state->cuda_copy_wall_start_ns, t0_ns);
-            atomic_fetch_max(job_state->cuda_copy_wall_end_ns, t1_ns);
-            atomic_fetch_min(job_state->file_io_wall_start_ns, t1_ns);
-            atomic_fetch_max(job_state->file_io_wall_end_ns, t2_ns);
-            job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
+            float cuda_elapsed_ms = 0.0f;
+            err = cudaEventElapsedTime(&cuda_elapsed_ms, copy_start_event, copy_end_event);
+            TORCH_CHECK(err == cudaSuccess, "cudaEventElapsedTime failed");
+            int64_t cuda_copy_ns =
+                static_cast<int64_t>(std::llround(cuda_elapsed_ms * 1000000.0));
+            int64_t cuda_start_ns = t1_ns - cuda_copy_ns;
+            int64_t task_num_bytes = static_cast<int64_t>(buf.size);
+            {
+              std::lock_guard<std::mutex> samples_lock(job_state->samples_mutex);
+              job_state->cuda_copy_samples.emplace_back(
+                  cuda_start_ns, cuda_copy_ns, task_num_bytes);
+              job_state->file_io_samples.emplace_back(
+                  t1_ns, t2_ns - t1_ns, task_num_bytes);
+            }
+            job_state->num_bytes.fetch_add(task_num_bytes);
             job_state->completed_tasks.fetch_add(1);
             if (!success) {
               FS_LOG_ERROR("Store failed during file write: " << dst_file);
@@ -332,6 +331,20 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
             // Perform asynchronous GPU copy and tensor swap.
             auto* cpu_base = static_cast<uint8_t*>(buf.ptr);
             bool is_store = false;
+            auto& tls_stream = ThreadPool::get_tls_stream();
+            cudaEvent_t copy_start_event = nullptr;
+            cudaEvent_t copy_end_event = nullptr;
+            ScopeGuard destroy_copy_events([&]() {
+              if (copy_start_event != nullptr) cudaEventDestroy(copy_start_event);
+              if (copy_end_event != nullptr) cudaEventDestroy(copy_end_event);
+            });
+
+            cudaError_t err = cudaEventCreate(&copy_start_event);
+            TORCH_CHECK(err == cudaSuccess, "cudaEventCreate failed");
+            err = cudaEventCreate(&copy_end_event);
+            TORCH_CHECK(err == cudaSuccess, "cudaEventCreate failed");
+            err = cudaEventRecord(copy_start_event, tls_stream.stream());
+            TORCH_CHECK(err == cudaSuccess, "cudaEventRecord failed");
             // Execute the copy operation
             success = TIME_EXPR(
                 "read phase 2: copy_cpu_tensor_to_gpu_tensors",
@@ -339,20 +352,28 @@ bool StorageOffloadEngine::async_load_gpu_blocks(
                 "file: ",
                 src_file);
 
-            auto& tls_stream = ThreadPool::get_tls_stream();
-            cudaError_t err = cudaStreamSynchronize(tls_stream.stream());
+            err = cudaEventRecord(copy_end_event, tls_stream.stream());
+            TORCH_CHECK(err == cudaSuccess, "cudaEventRecord failed");
+            err = cudaStreamSynchronize(tls_stream.stream());
             auto t2 = std::chrono::steady_clock::now();
             auto t0_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
             auto t1_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count();
             auto t2_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t2.time_since_epoch()).count();
-            atomic_fetch_max(job_state->file_io_ns, t1_ns - t0_ns);
-            atomic_fetch_max(job_state->cuda_copy_ns, t2_ns - t1_ns);
-            // Wall-clock spans for bandwidth calculation
-            atomic_fetch_min(job_state->file_io_wall_start_ns, t0_ns);
-            atomic_fetch_max(job_state->file_io_wall_end_ns, t1_ns);
-            atomic_fetch_min(job_state->cuda_copy_wall_start_ns, t1_ns);
-            atomic_fetch_max(job_state->cuda_copy_wall_end_ns, t2_ns);
-            job_state->num_bytes.fetch_add(static_cast<int64_t>(buf.size));
+            float cuda_elapsed_ms = 0.0f;
+            err = cudaEventElapsedTime(&cuda_elapsed_ms, copy_start_event, copy_end_event);
+            TORCH_CHECK(err == cudaSuccess, "cudaEventElapsedTime failed");
+            int64_t cuda_copy_ns =
+                static_cast<int64_t>(std::llround(cuda_elapsed_ms * 1000000.0));
+            int64_t cuda_start_ns = t2_ns - cuda_copy_ns;
+            int64_t task_num_bytes = static_cast<int64_t>(buf.size);
+            {
+              std::lock_guard<std::mutex> samples_lock(job_state->samples_mutex);
+              job_state->file_io_samples.emplace_back(
+                  t0_ns, t1_ns - t0_ns, task_num_bytes);
+              job_state->cuda_copy_samples.emplace_back(
+                  cuda_start_ns, cuda_copy_ns, task_num_bytes);
+            }
+            job_state->num_bytes.fetch_add(task_num_bytes);
             if (err != cudaSuccess) {
               FS_LOG_ERROR(
                   "cudaStreamSynchronize failed: " << cudaGetErrorString(err));

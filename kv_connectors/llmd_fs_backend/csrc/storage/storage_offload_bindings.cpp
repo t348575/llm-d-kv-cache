@@ -16,6 +16,7 @@
 
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 #include "storage_offload.hpp"
 
@@ -60,18 +61,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
       .def("get_finished",
            &StorageOffloadEngine::get_finished,
-           "Return a list of finished jobs with per-phase timing.\n\n"
-           "Each entry is a tuple:\n"
-           "  (job_id, success, num_bytes, cuda_copy_ns, file_io_ns,\n"
-           "   file_io_wall_ns, cuda_copy_wall_ns)\n\n"
-           "  job_id: the job identifier\n"
-           "  success: True if all tasks succeeded\n"
-           "  num_bytes: total bytes transferred across all tasks\n"
-           "  cuda_copy_ns: max single-task GPU<->CPU DMA time (ns)\n"
-           "  file_io_ns: max single-task file read/write time (ns)\n"
-           "  file_io_wall_ns: wall-clock span of all file I/O (ns),\n"
-           "    use num_bytes/file_io_wall_ns for aggregate bandwidth\n"
-           "  cuda_copy_wall_ns: wall-clock span of all CUDA copies (ns)")
+            "Return a list of finished jobs with per-phase timing.\n\n"
+            "Each entry is a tuple:\n"
+            "  (job_id, success, num_bytes, file_io_samples, cuda_copy_samples)\n\n"
+            "  job_id: the job identifier\n"
+            "  success: True if all tasks succeeded\n"
+            "  num_bytes: total bytes transferred across all tasks\n"
+            "  file_io_samples: list of (start_ns, duration_ns, num_bytes)\n"
+            "  cuda_copy_samples: list of (start_ns, duration_ns, num_bytes)")
 
       .def("async_store_gpu_blocks",
            &StorageOffloadEngine::async_store_gpu_blocks,

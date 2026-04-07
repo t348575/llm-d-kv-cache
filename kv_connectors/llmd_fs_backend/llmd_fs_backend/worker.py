@@ -78,15 +78,44 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
         Returns:
             List of completed transfer results.
         """
+
+        def merged_duration_ns(samples: list[tuple[int, int, int]]) -> int:
+            intervals = sorted(
+                (start_ns, start_ns + duration_ns)
+                for start_ns, duration_ns, _num_bytes in samples
+                if duration_ns > 0
+            )
+            if not intervals:
+                return 0
+
+            merged_start, merged_end = intervals[0]
+            merged_duration = 0
+            for start_ns, end_ns in intervals[1:]:
+                if start_ns <= merged_end:
+                    merged_end = max(merged_end, end_ns)
+                else:
+                    merged_duration += merged_end - merged_start
+                    merged_start, merged_end = start_ns, end_ns
+            return merged_duration + (merged_end - merged_start)
+
         finished_tuples = self.engine.get_finished()
         results = []
-        for (job_id, success, num_bytes, cuda_copy_ns, file_io_ns,
-             file_io_wall_ns, cuda_copy_wall_ns) in finished_tuples:
+        for (
+            job_id,
+            success,
+            num_bytes,
+            file_io_samples,
+            cuda_copy_samples,
+        ) in finished_tuples:
             end_ns = time.perf_counter_ns()
             job_meta = self._transfer_jobs.pop(job_id, None)
             if job_meta is not None:
                 wall_start_ns, profile_tid, req_id, direction = job_meta
                 is_store = direction == "gpu_to_storage"
+                file_io_samples = sorted(file_io_samples)
+                cuda_copy_samples = sorted(cuda_copy_samples)
+                file_io_wall_ns = merged_duration_ns(file_io_samples)
+                cuda_copy_wall_ns = merged_duration_ns(cuda_copy_samples)
                 # Compute bandwidth from wall-clock span
                 file_io_bw_gbps = (
                     (num_bytes / file_io_wall_ns) if file_io_wall_ns > 0 else 0.0
@@ -109,27 +138,55 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
                     tid=profile_tid,
                     args=job_args,
                 )
-                cuda_start_ns = wall_start_ns if is_store else wall_start_ns + file_io_wall_ns
-                file_start_ns = wall_start_ns + cuda_copy_wall_ns if is_store else wall_start_ns
-                profiler.add_event(
-                    name=f"cuda_staging({'gpu_to_cpu' if is_store else 'cpu_to_gpu'}, job={job_id})",
-                    category="cuda",
-                    start_ns=cuda_start_ns,
-                    duration_ns=cuda_copy_wall_ns,
-                    tid=profile_tid,
-                    args={"req_id": req_id, "num_bytes": num_bytes,
-                          "bw_GBps": round(cuda_copy_bw_gbps, 3)},
-                )
-                profiler.add_event(
-                    name=f"file_{'write' if is_store else 'read'}(job={job_id})",
-                    category="fs",
-                    start_ns=file_start_ns,
-                    duration_ns=file_io_wall_ns,
-                    tid=profile_tid,
-                    args={"req_id": req_id, "num_bytes": num_bytes,
-                          "bw_GBps": round(file_io_bw_gbps, 3)},
-                )
-            results.append(TransferResult(job_id=job_id, success=success, transfer_size=num_bytes))
+                for sample_idx, (start_ns, duration_ns, sample_num_bytes) in enumerate(
+                    cuda_copy_samples
+                ):
+                    profiler.add_event(
+                        name=(
+                            f"cuda_staging({'gpu_to_cpu' if is_store else 'cpu_to_gpu'}, "
+                            f"job={job_id}, sample={sample_idx})"
+                        ),
+                        category="cuda",
+                        start_ns=start_ns,
+                        duration_ns=duration_ns,
+                        tid=profile_tid,
+                        args={
+                            "req_id": req_id,
+                            "num_bytes": sample_num_bytes,
+                            "bw_GBps": round(
+                                (sample_num_bytes / duration_ns)
+                                if duration_ns > 0
+                                else 0.0,
+                                3,
+                            ),
+                        },
+                    )
+                for sample_idx, (start_ns, duration_ns, sample_num_bytes) in enumerate(
+                    file_io_samples
+                ):
+                    profiler.add_event(
+                        name=(
+                            f"file_{'write' if is_store else 'read'}"
+                            f"(job={job_id}, sample={sample_idx})"
+                        ),
+                        category="fs",
+                        start_ns=start_ns,
+                        duration_ns=duration_ns,
+                        tid=profile_tid,
+                        args={
+                            "req_id": req_id,
+                            "num_bytes": sample_num_bytes,
+                            "bw_GBps": round(
+                                (sample_num_bytes / duration_ns)
+                                if duration_ns > 0
+                                else 0.0,
+                                3,
+                            ),
+                        },
+                    )
+            results.append(
+                TransferResult(job_id=job_id, success=success, transfer_size=num_bytes)
+            )
         return results
 
     def wait(self, job_ids: set[int]):
@@ -183,8 +240,13 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
 class GPUToStorageHandler(BaseStorageOffloadingHandler):
     """Handler for GPU -> Storage (PUT) transfers."""
 
-    def transfer_async(self, job_id: int, spec: TransferSpec,
-                       profile_tid: str = "kv_store", req_id: str = "") -> bool:
+    def transfer_async(
+        self,
+        job_id: int,
+        spec: TransferSpec,
+        profile_tid: str = "kv_store",
+        req_id: str = "",
+    ) -> bool:
         """
         Launch an asynchronous transfer GPU -> Storage.
 
@@ -206,17 +268,29 @@ class GPUToStorageHandler(BaseStorageOffloadingHandler):
         )
 
         wall_start_ns = time.perf_counter_ns()
-        success = self.engine.async_store_gpu_blocks(job_id, dst_files, per_file_block_ids)
+        success = self.engine.async_store_gpu_blocks(
+            job_id, dst_files, per_file_block_ids
+        )
         if success:
-            self._transfer_jobs[job_id] = (wall_start_ns, profile_tid, req_id, "gpu_to_storage")
+            self._transfer_jobs[job_id] = (
+                wall_start_ns,
+                profile_tid,
+                req_id,
+                "gpu_to_storage",
+            )
         return success
 
 
 class StorageToGPUHandler(BaseStorageOffloadingHandler):
     """Handler for asynchronous transfers from storage to GPU."""
 
-    def transfer_async(self, job_id: int, spec: TransferSpec,
-                       profile_tid: str = "kv_load", req_id: str = "") -> bool:
+    def transfer_async(
+        self,
+        job_id: int,
+        spec: TransferSpec,
+        profile_tid: str = "kv_load",
+        req_id: str = "",
+    ) -> bool:
         """
         Launch an asynchronous transfer Storage -> GPU.
 
@@ -238,9 +312,16 @@ class StorageToGPUHandler(BaseStorageOffloadingHandler):
         )
 
         wall_start_ns = time.perf_counter_ns()
-        success = self.engine.async_load_gpu_blocks(job_id, src_files, per_file_block_ids)
+        success = self.engine.async_load_gpu_blocks(
+            job_id, src_files, per_file_block_ids
+        )
         if success:
-            self._transfer_jobs[job_id] = (wall_start_ns, profile_tid, req_id, "storage_to_gpu")
+            self._transfer_jobs[job_id] = (
+                wall_start_ns,
+                profile_tid,
+                req_id,
+                "storage_to_gpu",
+            )
         return success
 
 
@@ -259,7 +340,7 @@ class StorageOffloadingHandlers:
         read_preferring_ratio: float = DEFAULT_READ_PREFERRING_WORKERS_RATIO,
         use_odirect: bool = False,
     ):
-        threads_per_gpu = min(threads_per_gpu, int(os.cpu_count()))
+        threads_per_gpu = min(threads_per_gpu, os.cpu_count() or 1)
         tensors, kernel_block_size = StorageOffloadingHandlers._get_tensors(
             kv_caches, attn_backends
         )
