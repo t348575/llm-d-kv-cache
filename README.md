@@ -1,3 +1,9 @@
+# Modified vLLM kv-cache with support for:
+* o_direct
+* decorators for profiling kv-cache I/O with [vllm](https://github.com/t348575/vllm) (also decorated) using [simple-profiler](https://github.com/t348575/simple-profiler/)
+* Updated to run with latest vLLM offload API spec
+* Removed minimum staging buffer size (allowing for small kv-caches when running smaller models)
+
 [![Go Report Card](https://goreportcard.com/badge/github.com/llm-d/llm-d-kv-cache)](https://goreportcard.com/report/github.com/llm-d/llm-d-kv-cache)
 [![Go Reference](https://pkg.go.dev/badge/github.com/llm-d/llm-d-kv-cache.svg)](https://pkg.go.dev/github.com/llm-d/llm-d-kv-cache)
 [![License](https://img.shields.io/github/license/llm-d/llm-d-kv-cache)](LICENSE)
