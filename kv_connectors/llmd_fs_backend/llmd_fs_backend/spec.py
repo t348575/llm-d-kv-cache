@@ -16,11 +16,10 @@ from collections.abc import Iterator
 
 import torch
 from vllm.config import VllmConfig
-from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import OffloadingSpec
+from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 from llmd_fs_backend.file_mapper import FileMapper
@@ -63,9 +62,7 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         self.offloaded_block_size = int(
             self.extra_config.get("block_size", DEFAULT_STORAGE_BLOCK_SIZE)
         )
-        self.use_odirect = bool(
-            self.extra_config.get("use_odirect", False)
-        )
+        self.use_odirect = bool(self.extra_config.get("use_odirect", False))
 
         # gpu_block_size is a tuple (one per KV cache group); all groups must
         # have the same block size for shared-storage offloading.
@@ -79,7 +76,9 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         assert self.offloaded_block_size % self._single_gpu_block_size == 0, (
             "offloaded_block_size must be a multiple of gpu_block_size"
         )
-        self.gpu_blocks_per_file = self.offloaded_block_size // self._single_gpu_block_size
+        self.gpu_blocks_per_file = (
+            self.offloaded_block_size // self._single_gpu_block_size
+        )
         self.block_size_factor = self.gpu_blocks_per_file
 
         self.read_preferring_ratio = float(
@@ -116,15 +115,13 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
 
     def get_handlers(
         self,
-        kv_caches: dict[str, torch.Tensor],
-        attn_backends: dict[str, type[AttentionBackend]],
+        kv_caches: CanonicalKVCaches,
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         if not self._handlers:
             self._handlers = StorageOffloadingHandlers(
                 file_mapper=self.file_mapper,
                 gpu_blocks_per_file=self.gpu_blocks_per_file,
                 gpu_block_size=self._single_gpu_block_size,
-                attn_backends=attn_backends,
                 kv_caches=kv_caches,
                 threads_per_gpu=self.threads_per_gpu,
                 max_staging_memory_gb=self.max_staging_memory_gb,

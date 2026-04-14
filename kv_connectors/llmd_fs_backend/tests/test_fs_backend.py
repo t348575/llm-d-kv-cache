@@ -23,9 +23,13 @@ from collections.abc import Iterable
 
 import pytest
 import torch
-from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
-from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_offload.abstract import OffloadKey, make_offload_key
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
+from vllm.v1.kv_offload.spec import (
+    CanonicalKVCacheRef,
+    CanonicalKVCacheTensor,
+    CanonicalKVCaches,
+)
 
 from llmd_fs_backend.file_mapper import FileMapper
 from llmd_fs_backend.mediums import SharedStorageLoadStoreSpec
@@ -54,26 +58,55 @@ def create_dummy_kv_tensors(
     return [torch.rand(shape, dtype=dtype, device="cuda") for _ in range(num_layers)]
 
 
-def get_prefix_hash(token_ids: Iterable[int]) -> BlockHash:
-    """Generate a stable 64-bit hash for a list of token IDs
-    by packing each as uint32."""
+def get_prefix_hash_bytes(token_ids: Iterable[int]) -> bytes:
+    """Generate a stable 64-bit block-hash payload for a list of token IDs."""
     buf = bytearray()
     for t in token_ids:
         buf += struct.pack("<I", int(t) & 0xFFFFFFFF)
     digest_int = int.from_bytes(hashlib.sha256(buf).digest()[:8], "big")
-    # Convert 64-bit int to 8-byte little-endian representation
-    return BlockHash((digest_int & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little"))
+    return (digest_int & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
 
 
-def make_gpu_specs(block_ids: list[int]) -> GPULoadStoreSpec:
+def make_gpu_specs(
+    block_ids: list[int],
+    *,
+    block_indices: list[int] | None = None,
+) -> GPULoadStoreSpec:
     """Create GPULoadStoreSpec objects for the given block IDs."""
-    return GPULoadStoreSpec(block_ids)
+    return GPULoadStoreSpec(
+        block_ids,
+        group_sizes=[len(block_ids)],
+        block_indices=block_indices,
+    )
+
+
+def make_canonical_kv_caches(kv_tensors: list[torch.Tensor]) -> CanonicalKVCaches:
+    tensors: list[CanonicalKVCacheTensor] = []
+    group_refs: list[CanonicalKVCacheRef] = []
+
+    for raw_tensor in kv_tensors:
+        for sub_tensor in raw_tensor:
+            page_size_bytes = sub_tensor[0].numel() * sub_tensor.element_size()
+            tensors.append(
+                CanonicalKVCacheTensor(
+                    tensor=sub_tensor,
+                    page_size_bytes=page_size_bytes,
+                )
+            )
+            group_refs.append(
+                CanonicalKVCacheRef(
+                    tensor_idx=len(tensors) - 1,
+                    page_size_bytes=page_size_bytes,
+                )
+            )
+
+    return CanonicalKVCaches(tensors=tensors, group_data_refs=[group_refs])
 
 
 def make_storage_specs(
     num_files: int,
     start_offset: int = 0,
-) -> tuple[SharedStorageLoadStoreSpec, list[BlockHash]]:
+) -> tuple[SharedStorageLoadStoreSpec, list[OffloadKey]]:
     """Create SharedStorageLoadStoreSpec objects and their hashes for
     a given number of files.
 
@@ -85,13 +118,15 @@ def make_storage_specs(
         (100 + (start_offset + i) * 100, 117 + (start_offset + i) * 100)
         for i in range(num_files)
     ]
-    hashes = [get_prefix_hash(range(a, b)) for (a, b) in ranges]
-    return SharedStorageLoadStoreSpec(hashes), hashes
+    keys = [
+        make_offload_key(get_prefix_hash_bytes(range(a, b)), 0) for (a, b) in ranges
+    ]
+    return SharedStorageLoadStoreSpec(keys), keys
 
 
 def cleanup_files(
     file_mapper: FileMapper,
-    block_hashes: list[BlockHash],
+    block_hashes: list[OffloadKey],
 ) -> None:
     """Remove existing files for the provided block hashes."""
     for h in block_hashes:
@@ -145,7 +180,7 @@ def total_block_size_mb(
 
 def log_file_info(
     base_path: str,
-    block_hashes: list[BlockHash],
+    block_hashes: list[OffloadKey],
 ) -> tuple[int, list[float]]:
     """Log information about the files corresponding to the given block hashes."""
     file_sizes = []
@@ -226,10 +261,8 @@ def roundtrip_once(
     put_storage_specs, block_hashes = make_storage_specs(put_num_files)
     cleanup_files(file_mapper, block_hashes)
 
-    # set names for layers
-    attn_backends = {f"layer_{i}": FlashAttentionBackend for i in range(num_layers)}
-    kv_caches_original = {f"layer_{i}": original[i] for i in range(num_layers)}
-    kv_caches_restored = {f"layer_{i}": restored[i] for i in range(num_layers)}
+    kv_caches_original = make_canonical_kv_caches(original)
+    kv_caches_restored = make_canonical_kv_caches(restored)
 
     # PUT phase
     kv_caches_original_handler = StorageOffloadingHandlers(
@@ -238,7 +271,6 @@ def roundtrip_once(
         gpu_blocks_per_file=gpu_blocks_per_file,
         gpu_block_size=gpu_block_size,
         threads_per_gpu=threads_per_gpu,
-        attn_backends=attn_backends,
     )
     put_handler = kv_caches_original_handler.gpu_to_storage_handler
     start_put = time.time()
@@ -259,15 +291,15 @@ def roundtrip_once(
         gpu_blocks_per_file=gpu_blocks_per_file,
         threads_per_gpu=threads_per_gpu,
         gpu_block_size=gpu_block_size,
-        attn_backends=attn_backends,
     )
     get_handler = kv_caches_restored_handler.storage_to_gpu_handler
 
-    get_gpu_specs = make_gpu_specs(read_block_ids)
-    get_num_files = math.ceil(len(read_block_ids) / gpu_blocks_per_file)
-    start_index = len(put_storage_specs.block_hashes) - get_num_files
+    get_gpu_specs = make_gpu_specs(read_block_ids, block_indices=[read_block_ids[0]])
+    read_offset = read_block_ids[0] % gpu_blocks_per_file
+    get_num_files = math.ceil((len(read_block_ids) + read_offset) / gpu_blocks_per_file)
+    start_index = read_block_ids[0] // gpu_blocks_per_file
     get_storage_spec = SharedStorageLoadStoreSpec(
-        put_storage_specs.block_hashes[start_index:]
+        put_storage_specs.keys[start_index : start_index + get_num_files]
     )
     start_get = time.time()
     get_handler.transfer_async(job_id=2, spec=(get_storage_spec, get_gpu_specs))
