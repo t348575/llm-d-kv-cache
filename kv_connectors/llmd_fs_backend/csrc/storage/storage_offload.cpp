@@ -185,6 +185,7 @@ bool StorageOffloadEngine::async_store_gpu_blocks(
           // Check if dst_file file already exists - skip write if it does
           if (std::ifstream(dst_file).good()) {
             update_atime(dst_file);
+            record_exists_skip();
             job_state->completed_tasks.fetch_add(1);
             return true;  // File exists
           }

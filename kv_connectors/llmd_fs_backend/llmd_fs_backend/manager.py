@@ -14,6 +14,7 @@
 
 import os
 from collections.abc import Iterable
+import time
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.abstract import (
@@ -25,6 +26,7 @@ from vllm.v1.kv_offload.abstract import (
 
 from llmd_fs_backend.file_mapper import FileMapper
 from llmd_fs_backend.mediums import SharedStorageLoadStoreSpec
+from llmd_fs_backend.stats import connector_stats
 
 logger = init_logger(__name__)
 
@@ -44,12 +46,22 @@ class SharedStorageOffloadingManager(OffloadingManager):
         """
         Return how many consecutive blocks from the start are already offloaded.
         """
+        key_list = list(keys)
+        start_ns = time.perf_counter_ns()
         hit_count = 0
-        for key in keys:
+        checked_keys = 0
+        for key in key_list:
+            checked_keys += 1
             file_path = self.file_mapper.get_file_name(key)
             if not os.path.exists(file_path):
                 break
             hit_count += 1
+        connector_stats.record_lookup(
+            checked_keys=checked_keys,
+            hit_count=hit_count,
+            miss_count=max(0, checked_keys - hit_count),
+            latency_ns=time.perf_counter_ns() - start_ns,
+        )
         return hit_count
 
     # ----------------------------------------------------------------------
@@ -83,6 +95,7 @@ class SharedStorageOffloadingManager(OffloadingManager):
         If a file already exists, the file thread handles it.
         """
         keys_to_store = list(keys)
+        connector_stats.record_prepare_store(len(keys_to_store))
 
         # Set up store spec
         store_spec = SharedStorageLoadStoreSpec(keys_to_store)

@@ -32,3 +32,10 @@ bool read_buffer_from_file(const std::string& path,
 
 // update_atime update only the atime of a file without changing mtime
 void update_atime(const std::string& path);
+
+void record_file_write(size_t num_bytes);
+void record_file_read(size_t num_bytes);
+void record_parent_dir_ensure();
+void record_file_rename();
+void record_exists_skip();
+void record_atime_update();

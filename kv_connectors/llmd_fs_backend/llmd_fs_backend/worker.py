@@ -31,6 +31,7 @@ from vllm.v1.kv_offload.worker.worker import (
 
 from llmd_fs_backend.file_mapper import FileMapper
 from llmd_fs_backend.mediums import SharedStorageLoadStoreSpec
+from llmd_fs_backend.stats import connector_stats
 
 logger = init_logger(__name__)
 
@@ -290,6 +291,11 @@ class GPUToStorageHandler(BaseStorageOffloadingHandler):
         success = self.engine.async_store_gpu_blocks(
             job_id, dst_files, per_file_block_ids
         )
+        connector_stats.record_publish_submit(
+            file_count=len(dst_files),
+            latency_ns=time.perf_counter_ns() - wall_start_ns,
+            success=success,
+        )
         if success:
             self._transfer_jobs[job_id] = (
                 wall_start_ns,
@@ -335,6 +341,11 @@ class StorageToGPUHandler(BaseStorageOffloadingHandler):
         wall_start_ns = time.perf_counter_ns()
         success = self.engine.async_load_gpu_blocks(
             job_id, src_files, per_file_block_ids
+        )
+        connector_stats.record_load_submit(
+            file_count=len(src_files),
+            latency_ns=time.perf_counter_ns() - wall_start_ns,
+            success=success,
         )
         if success:
             self._transfer_jobs[job_id] = (
