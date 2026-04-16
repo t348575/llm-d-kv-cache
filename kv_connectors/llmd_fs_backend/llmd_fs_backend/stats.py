@@ -1,11 +1,7 @@
 import os
+import sys
 import threading
 import time
-
-from vllm.logger import init_logger
-
-
-logger = init_logger(__name__)
 
 
 class ConnectorStats:
@@ -161,7 +157,7 @@ class ConnectorStats:
             else 0.0
         )
 
-        logger.info(
+        message = (
             "llmd_fs_connector_stats "
             "lookup_txn=%d lookup_keys=%d lookup_hits=%d lookup_misses=%d lookup_avg_us=%.1f "
             "lookup_txn_s=%.1f lookup_keys_s=%.1f lookup_hits_s=%.1f lookup_misses_s=%.1f "
@@ -169,7 +165,8 @@ class ConnectorStats:
             "publish_submit_txn=%d publish_submit_files=%d publish_submit_fail=%d publish_submit_avg_us=%.1f "
             "publish_submit_txn_s=%.1f publish_submit_files_s=%.1f publish_submit_fail_s=%.1f "
             "load_submit_txn=%d load_submit_files=%d load_submit_fail=%d load_submit_avg_us=%.1f "
-            "load_submit_txn_s=%.1f load_submit_files_s=%.1f load_submit_fail_s=%.1f",
+            "load_submit_txn_s=%.1f load_submit_files_s=%.1f load_submit_fail_s=%.1f"
+        ) % (
             self._lookup_txn,
             self._lookup_keys,
             self._lookup_hits,
@@ -198,6 +195,7 @@ class ConnectorStats:
             load_submit_file_rate,
             load_submit_fail_rate,
         )
+        print(message, file=sys.stderr, flush=True)
 
 
 connector_stats = ConnectorStats()
