@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import os
+import time
 from collections.abc import Iterable
+
+from simple_profiler import profiler
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.abstract import (
@@ -44,12 +47,41 @@ class SharedStorageOffloadingManager(OffloadingManager):
         """
         Return how many consecutive blocks from the start are already offloaded.
         """
+        start_ns = time.perf_counter_ns()
         hit_count = 0
+        checked = 0
         for key in keys:
+            checked += 1
+            file_name_start_ns = time.perf_counter_ns()
             file_path = self.file_mapper.get_file_name(key)
-            if not os.path.exists(file_path):
+            if profiler._active:
+                profiler.add_event(
+                    "storage_manager.lookup_file_name",
+                    "kv_offload",
+                    file_name_start_ns,
+                    time.perf_counter_ns() - file_name_start_ns,
+                )
+            exists_start_ns = time.perf_counter_ns()
+            exists = os.path.exists(file_path)
+            if profiler._active:
+                profiler.add_event(
+                    "storage_manager.lookup_exists_one",
+                    "kv_offload",
+                    exists_start_ns,
+                    time.perf_counter_ns() - exists_start_ns,
+                    args={"hit": exists},
+                )
+            if not exists:
                 break
             hit_count += 1
+        if profiler._active:
+            profiler.add_event(
+                "storage_manager.lookup_exists",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={"checked_keys": checked, "hit_count": hit_count},
+            )
         return hit_count
 
     # ----------------------------------------------------------------------
@@ -59,7 +91,17 @@ class SharedStorageOffloadingManager(OffloadingManager):
         """
         For shared storage, loading is stateless - return specs that point to files.
         """
-        return SharedStorageLoadStoreSpec(keys)
+        start_ns = time.perf_counter_ns()
+        spec = SharedStorageLoadStoreSpec(keys)
+        if profiler._active:
+            profiler.add_event(
+                "storage_manager.prepare_load_spec",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={"num_keys": len(spec.keys)},
+            )
+        return spec
 
     def touch(self, keys: Iterable[OffloadKey]) -> None:
         """
@@ -79,19 +121,72 @@ class SharedStorageOffloadingManager(OffloadingManager):
     def prepare_store(self, keys: Iterable[OffloadKey]) -> PrepareStoreOutput | None:
         """
         Prepare storing new blocks.
-        Shared storage always accepts new blocks. Eviction is not needed.
-        If a file already exists, the file thread handles it.
+        Shared storage stores only blocks that do not already exist on disk.
+        Eviction is not needed.
         """
-        keys_to_store = list(keys)
+        start_ns = time.perf_counter_ns()
+        checked = 0
+        keys_to_store = []
+        for key in keys:
+            checked += 1
+            file_name_start_ns = time.perf_counter_ns()
+            file_path = self.file_mapper.get_file_name(key)
+            if profiler._active:
+                profiler.add_event(
+                    "storage_manager.prepare_store_file_name",
+                    "kv_offload",
+                    file_name_start_ns,
+                    time.perf_counter_ns() - file_name_start_ns,
+                )
+            exists_start_ns = time.perf_counter_ns()
+            exists = os.path.exists(file_path)
+            if profiler._active:
+                profiler.add_event(
+                    "storage_manager.prepare_store_exists_one",
+                    "kv_offload",
+                    exists_start_ns,
+                    time.perf_counter_ns() - exists_start_ns,
+                    args={"exists": exists},
+                )
+            if not exists:
+                keys_to_store.append(key)
+
+        if not keys_to_store:
+            if profiler._active:
+                profiler.add_event(
+                    "storage_manager.prepare_store_exists",
+                    "kv_offload",
+                    start_ns,
+                    time.perf_counter_ns() - start_ns,
+                    args={
+                        "checked_keys": checked,
+                        "keys_to_store": 0,
+                        "result": "already_stored",
+                    },
+                )
+            return None
 
         # Set up store spec
         store_spec = SharedStorageLoadStoreSpec(keys_to_store)
 
-        return PrepareStoreOutput(
+        output = PrepareStoreOutput(
             keys_to_store=keys_to_store,
             store_spec=store_spec,
             evicted_keys=[],  # no eviction needed
         )
+        if profiler._active:
+            profiler.add_event(
+                "storage_manager.prepare_store_exists",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={
+                    "checked_keys": checked,
+                    "keys_to_store": len(keys_to_store),
+                    "result": "prepared",
+                },
+            )
+        return output
 
     def complete_store(self, keys: Iterable[OffloadKey], success: bool = True) -> None:
         """

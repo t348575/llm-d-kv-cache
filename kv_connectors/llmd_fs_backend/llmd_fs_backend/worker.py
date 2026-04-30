@@ -19,7 +19,7 @@ from collections.abc import Sequence
 
 import storage_offload
 import torch
-from simple_profiler import profiler
+from simple_profiler import profile_scope, profiler
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import CanonicalKVCaches
@@ -99,7 +99,16 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
                     merged_start, merged_end = start_ns, end_ns
             return merged_duration + (merged_end - merged_start)
 
+        poll_start_ns = time.perf_counter_ns()
         finished_tuples = self.engine.get_finished()
+        if profiler._active:
+            profiler.add_event(
+                "storage_worker.poll_finished",
+                "kv_offload",
+                poll_start_ns,
+                time.perf_counter_ns() - poll_start_ns,
+                args={"num_finished": len(finished_tuples)},
+            )
         results = []
         for (
             job_id,
@@ -197,13 +206,32 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
         Args:
             job_ids: Set of job IDs to wait for.
         """
+        wait_start_ns = time.perf_counter_ns()
         for job_id in job_ids:
-            self.engine.wait_job(job_id)
+            with profile_scope(
+                "storage_worker.wait_job",
+                "kv_offload",
+                args={"job_id": job_id},
+            ):
+                self.engine.wait_job(job_id)
+        if profiler._active:
+            profiler.add_event(
+                "storage_worker.wait",
+                "kv_offload",
+                wait_start_ns,
+                time.perf_counter_ns() - wait_start_ns,
+                args={"num_jobs": len(job_ids)},
+            )
 
     def shutdown(self) -> None:
         pending_job_ids = set(self._transfer_jobs)
         if pending_job_ids:
-            self.wait(pending_job_ids)
+            with profile_scope(
+                "storage_worker.shutdown_wait_pending",
+                "kv_offload",
+                args={"num_pending": len(pending_job_ids)},
+            ):
+                self.wait(pending_job_ids)
             self._transfer_jobs.clear()
 
     def _build_file_block_mapping(
@@ -241,7 +269,8 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
             chunk_size = self.gpu_blocks_per_file - first_block_index
             for key in group_keys:
                 end = min(start + chunk_size, len(group_block_ids))
-                files.append(self.file_mapper.get_file_name(key))
+                with profile_scope("storage_worker.file_name", "kv_offload"):
+                    files.append(self.file_mapper.get_file_name(key))
                 per_file_block_ids.append(group_block_ids[start:end])
                 start = end
                 chunk_size = self.gpu_blocks_per_file
@@ -280,16 +309,30 @@ class GPUToStorageHandler(BaseStorageOffloadingHandler):
         assert isinstance(src_spec, GPULoadStoreSpec)
         assert isinstance(dst_spec, SharedStorageLoadStoreSpec)
 
-        dst_files, per_file_block_ids = self._build_file_block_mapping(
-            keys=dst_spec.keys,
-            block_ids=src_spec.block_ids,
-            group_sizes=src_spec.group_sizes,
-        )
+        with profile_scope(
+            f"storage_worker.build_store_file_mapping(job={job_id})",
+            "kv_offload",
+            args={
+                "req_id": req_id,
+                "num_keys": len(dst_spec.keys),
+                "num_gpu_blocks": int(src_spec.block_ids.size),
+            },
+        ):
+            dst_files, per_file_block_ids = self._build_file_block_mapping(
+                keys=dst_spec.keys,
+                block_ids=src_spec.block_ids,
+                group_sizes=src_spec.group_sizes,
+            )
 
         wall_start_ns = time.perf_counter_ns()
-        success = self.engine.async_store_gpu_blocks(
-            job_id, dst_files, per_file_block_ids
-        )
+        with profile_scope(
+            f"storage_worker.submit_store(job={job_id})",
+            "kv_offload",
+            args={"req_id": req_id, "num_files": len(dst_files)},
+        ):
+            success = self.engine.async_store_gpu_blocks(
+                job_id, dst_files, per_file_block_ids
+            )
         if success:
             self._transfer_jobs[job_id] = (
                 wall_start_ns,
@@ -325,17 +368,31 @@ class StorageToGPUHandler(BaseStorageOffloadingHandler):
         assert isinstance(src_spec, SharedStorageLoadStoreSpec)
         assert isinstance(dst_spec, GPULoadStoreSpec)
 
-        src_files, per_file_block_ids = self._build_file_block_mapping(
-            keys=src_spec.keys,
-            block_ids=dst_spec.block_ids,
-            group_sizes=dst_spec.group_sizes,
-            block_indices=dst_spec.block_indices,
-        )
+        with profile_scope(
+            f"storage_worker.build_load_file_mapping(job={job_id})",
+            "kv_offload",
+            args={
+                "req_id": req_id,
+                "num_keys": len(src_spec.keys),
+                "num_gpu_blocks": int(dst_spec.block_ids.size),
+            },
+        ):
+            src_files, per_file_block_ids = self._build_file_block_mapping(
+                keys=src_spec.keys,
+                block_ids=dst_spec.block_ids,
+                group_sizes=dst_spec.group_sizes,
+                block_indices=dst_spec.block_indices,
+            )
 
         wall_start_ns = time.perf_counter_ns()
-        success = self.engine.async_load_gpu_blocks(
-            job_id, src_files, per_file_block_ids
-        )
+        with profile_scope(
+            f"storage_worker.submit_load(job={job_id})",
+            "kv_offload",
+            args={"req_id": req_id, "num_files": len(src_files)},
+        ):
+            success = self.engine.async_load_gpu_blocks(
+                job_id, src_files, per_file_block_ids
+            )
         if success:
             self._transfer_jobs[job_id] = (
                 wall_start_ns,
