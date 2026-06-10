@@ -24,14 +24,13 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "thread_pool.hpp"
 #include "tensor_copier.hpp"
-
-using PhaseSample = std::tuple<int64_t, int64_t, int64_t>;
+#include "storage_handler.hpp"
+#include "storage_types.hpp"
 
 // Tracks progress and results for a multi-file async PUT/GET job
 struct JobState {
@@ -43,11 +42,8 @@ struct JobState {
   int total_tasks{0};
   // Flag indicating if all tasks succeeded
   std::atomic<bool> all_success{true};
-  std::atomic<int64_t> num_bytes{0};
-  // Per-task phase timing samples as (start_ns, duration_ns, num_bytes).
-  std::mutex samples_mutex;
-  std::vector<PhaseSample> file_io_samples;
-  std::vector<PhaseSample> cuda_copy_samples;
+  // Flag to signal cancellation (e.g. on preemption) — queued tasks bail early
+  std::atomic<bool> cancelled{false};
 };
 
 // StorageOffloadEngine class manages asynchronous storage offload operations
@@ -57,38 +53,75 @@ class StorageOffloadEngine {
   std::mutex m_jobs_mutex;
   // Global map of job_id to JobState, tracking async job progress
   std::map<int, std::shared_ptr<JobState>> m_jobs;
-  // Thread pool for scheduling async PUT/GET tasks
-  ThreadPool m_thread_pool;
   // Handles GPU <-> CPU tensor copy operations
   TensorCopier m_tensor_copier;
-  // Whether to use O_DIRECT (page-cache bypass) for file I/O
-  bool m_use_odirect;
-  // Calculate staging buffer size in bytes
-  static size_t calc_staging_bytes(int gpu_blocks_per_file,
-                                   const std::vector<torch::Tensor>& tensors);
+  // GDS operation mode parsed from constructor argument (must precede
+  // m_thread_pool)
+  GdsMode m_gds_mode;
+  // Thread pool for scheduling async PUT/GET tasks
+  ThreadPool m_thread_pool;
+  // Storage handler for read operations
+  std::shared_ptr<StorageHandler> m_read_handler;
+  // Storage handler for write operations
+  std::shared_ptr<StorageHandler> m_write_handler;
+  // GPU blocks per file (needed for operations)
+  int m_gpu_blocks_per_file;
+  // Dynamic write queue limit: Exponential Moving Average (EMA) of
+  // per-file write duration (microseconds).
+  std::atomic<uint64_t> m_avg_write_duration_us{0};
+  // Max seconds of queued writes before dropping (0 = disabled)
+  float m_max_write_queued_seconds;
+  // Counter of dropped writes (for rate-limited logging)
+  size_t m_dropped_writes{0};
+  // Calculate staging buffer size in bytes.
+  // Sized for the largest group so one buffer fits any group's transfer.
+  // Uses canonical per-group block bytes from CanonicalKVCacheRef rather
+  // than introspecting torch tensors.
+  static size_t calc_staging_bytes(
+      int gpu_blocks_per_file,
+      const std::vector<int64_t>& per_group_block_bytes);
+  // Initialize read/write handlers: GdsFileIO if available, FileIO otherwise
+  void init_handlers(GdsMode gds_mode,
+                     const std::vector<torch::Tensor>& tensors);
   // Get current device
   static int get_device_id();
 
  public:
-  // Initialize IO threads, CUDA streams, and staging memory pool
+  // Initialize IO threads, CUDA streams, and staging memory pool.
+  // group_tensor_indices[i] = list of tensor indices into `tensors` used by
+  // KV cache group i. For single-group (non-HMA) models, pass a single list
+  // containing indices for all tensors.
+  // per_group_block_bytes[i] = bytes per block for group i, summed across
+  // that group's layers (sourced from CanonicalKVCacheRef.page_size_bytes
+  // on the Python side).
   StorageOffloadEngine(int io_threads,
                        int gpu_blocks_per_file,
                        std::vector<torch::Tensor>& tensors,
+                       std::vector<std::vector<int64_t>> group_tensor_indices,
+                       std::vector<int64_t> per_group_block_bytes,
                        int read_preferring_workers,
-                       bool use_odirect = false);
-  // Return finished jobs:
-  // (job_id, success, num_bytes, file_io_samples, cuda_copy_samples)
-  std::vector<std::tuple<int, bool, int64_t,
-                         std::vector<PhaseSample>,
-                         std::vector<PhaseSample>>> get_finished();
+                       const std::string& gds_mode,
+                       float max_write_queued_seconds = 10.0);
+  // Return finished jobs and their success status
+  std::vector<std::pair<int, bool>> get_finished();
+  // Update EMA of per-file write duration (called by write workers)
+  void update_write_duration(uint64_t duration_us);
+  // Compute dynamic write queue limit based on avg write duration
+  size_t get_dynamic_write_queue_limit() const;
   // Wait for all tasks in the specified job to complete
   void wait_job(int job_id);
-  // Async GPU -> Storage transfer (PUT)
+  // Async GPU -> Storage transfer (PUT).
+  // head_offsets[i] = slot offset in dst_files[i] (in GPU blocks).
   bool async_store_gpu_blocks(int job_id,
+                              std::vector<int> group_indices,
                               std::vector<std::string> dst_files,
-                              std::vector<std::vector<int64_t>> all_block_ids);
-  // Async Storage -> GPU transfer (GET)
+                              std::vector<std::vector<int64_t>> all_block_ids,
+                              std::vector<int> head_offsets);
+  // Async Storage -> GPU transfer (GET).
+  // head_offsets[i] = slot offset in src_files[i] (in GPU blocks).
   bool async_load_gpu_blocks(int job_id,
+                             std::vector<int> group_indices,
                              std::vector<std::string> src_files,
-                             std::vector<std::vector<int64_t>> all_block_ids);
+                             std::vector<std::vector<int64_t>> all_block_ids,
+                             std::vector<int> head_offsets);
 };

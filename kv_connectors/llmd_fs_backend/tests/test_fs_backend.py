@@ -23,12 +23,14 @@ from collections.abc import Iterable
 
 import pytest
 import torch
-from vllm.v1.kv_offload.abstract import OffloadKey, make_offload_key
-from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import (
+from vllm.v1.core.kv_cache_utils import BlockHash
+from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
-    CanonicalKVCacheTensor,
     CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
+    OffloadKey,
+    make_offload_key,
 )
 
 from llmd_fs_backend.file_mapper import FileMapper
@@ -58,79 +60,138 @@ def create_dummy_kv_tensors(
     return [torch.rand(shape, dtype=dtype, device="cuda") for _ in range(num_layers)]
 
 
-def get_prefix_hash_bytes(token_ids: Iterable[int]) -> bytes:
-    """Generate a stable 64-bit block-hash payload for a list of token IDs."""
+def make_canonical_kv_caches(
+    kv_tensors: list[torch.Tensor],
+    num_groups: int = 1,
+) -> CanonicalKVCaches:
+    """Build a CanonicalKVCaches aliasing the storage of test KV tensors.
+
+    Test-side equivalent of vLLM's upstream canonicalization for FlashAttention.
+    Each layer tensor has shape (2, num_blocks, block_size, num_heads, head_size)
+    in fp16; canonical form wants (num_blocks, page_size_bytes) int8, with K and V
+    as separate tensors. We build those views zero-copy so that writes through the
+    canonical tensors hit the same storage the test later inspects.
+
+    With num_groups > 1, the per-layer K/V canonical tensors are split evenly
+    across groups (simulating HMA models with multiple attention types).
+    """
+    canonical_tensors: list[CanonicalKVCacheTensor] = []
+    layer_canonical_idx: list[tuple[int, int]] = []  # (k_idx, v_idx) per layer
+
+    for layer_tensor in kv_tensors:
+        assert layer_tensor.shape[0] == 2  # dim 0 is K/V, dim 1 is num_blocks
+        num_blocks = layer_tensor.shape[1]
+        # Bytes per block for K (or V) alone — full page is K+V, so "half".
+        half_page_bytes = layer_tensor.stride(1) * layer_tensor.element_size()
+
+        # Reinterpret the same storage as int8 (element_size=1 → shape values are
+        # byte counts; dtype-agnostic byte-level view). Zero copy.
+        raw = (
+            torch.tensor([], dtype=torch.int8, device=layer_tensor.device)
+            .set_(layer_tensor.untyped_storage())
+            .view(2, num_blocks, half_page_bytes)
+        )
+        # Split into K-view and V-view, each (num_blocks, half_page_bytes) int8.
+        layer_canonical: list[int] = []
+        for sub in raw.unbind(0):
+            layer_canonical.append(len(canonical_tensors))
+            canonical_tensors.append(
+                CanonicalKVCacheTensor(tensor=sub, page_size_bytes=half_page_bytes)
+            )
+        layer_canonical_idx.append((layer_canonical[0], layer_canonical[1]))
+
+    # Assign each layer's (K, V) canonical tensors to a group based on layer order.
+    num_layers = len(kv_tensors)
+    layers_per_group = max(num_layers // num_groups, 1)
+    all_group_refs: list[list[CanonicalKVCacheRef]] = [[] for _ in range(num_groups)]
+    for layer_idx, (k_idx, v_idx) in enumerate(layer_canonical_idx):
+        group_idx = min(layer_idx // layers_per_group, num_groups - 1)
+        for tensor_idx in (k_idx, v_idx):
+            all_group_refs[group_idx].append(
+                CanonicalKVCacheRef(
+                    tensor_idx=tensor_idx,
+                    page_size_bytes=canonical_tensors[tensor_idx].page_size_bytes,
+                )
+            )
+
+    return CanonicalKVCaches(tensors=canonical_tensors, group_data_refs=all_group_refs)
+
+
+def get_prefix_hash(token_ids: Iterable[int]) -> BlockHash:
+    """Generate a stable 64-bit hash for a list of token IDs
+    by packing each as uint32."""
     buf = bytearray()
     for t in token_ids:
         buf += struct.pack("<I", int(t) & 0xFFFFFFFF)
     digest_int = int.from_bytes(hashlib.sha256(buf).digest()[:8], "big")
-    return (digest_int & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
+    # Convert 64-bit int to 8-byte little-endian representation
+    return BlockHash((digest_int & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little"))
+
+
+def get_offload_key(token_ids: Iterable[int], group_idx: int = 0) -> OffloadKey:
+    """Generate an OffloadKey from token IDs and group index."""
+    return make_offload_key(get_prefix_hash(token_ids), group_idx)
 
 
 def make_gpu_specs(
     block_ids: list[int],
-    *,
+    group_sizes: list[int] | None = None,
     block_indices: list[int] | None = None,
 ) -> GPULoadStoreSpec:
-    """Create GPULoadStoreSpec objects for the given block IDs."""
+    """Create GPULoadStoreSpec objects for the given block IDs.
+
+    Args:
+        block_ids: GPU block IDs (flat, across all groups if multi-group).
+        group_sizes: Per-group block counts. Defaults to a single group with
+            all block_ids.
+        block_indices: Per-group logical index of the group's first block.
+            Required by the backend to map GPU blocks to files correctly when
+            a group starts unaligned to gpu_blocks_per_file (e.g., when only
+            a suffix is being transferred). Defaults to 0 per group.
+    """
+    if group_sizes is None:
+        group_sizes = [len(block_ids)]
+    if block_indices is None:
+        block_indices = [0] * len(group_sizes)
     return GPULoadStoreSpec(
-        block_ids,
-        group_sizes=[len(block_ids)],
-        block_indices=block_indices,
+        block_ids, group_sizes=group_sizes, block_indices=block_indices
     )
 
 
-def make_canonical_kv_caches(kv_tensors: list[torch.Tensor]) -> CanonicalKVCaches:
-    tensors: list[CanonicalKVCacheTensor] = []
-    group_refs: list[CanonicalKVCacheRef] = []
-
-    for raw_tensor in kv_tensors:
-        for sub_tensor in raw_tensor:
-            page_size_bytes = sub_tensor[0].numel() * sub_tensor.element_size()
-            tensors.append(
-                CanonicalKVCacheTensor(
-                    tensor=sub_tensor,
-                    page_size_bytes=page_size_bytes,
-                )
-            )
-            group_refs.append(
-                CanonicalKVCacheRef(
-                    tensor_idx=len(tensors) - 1,
-                    page_size_bytes=page_size_bytes,
-                )
-            )
-
-    return CanonicalKVCaches(tensors=tensors, group_data_refs=[group_refs])
-
-
 def make_storage_specs(
-    num_files: int,
+    num_files: int | list[int],
     start_offset: int = 0,
 ) -> tuple[SharedStorageLoadStoreSpec, list[OffloadKey]]:
-    """Create SharedStorageLoadStoreSpec objects and their hashes for
-    a given number of files.
+    """Create SharedStorageLoadStoreSpec objects and their keys.
 
     Args:
-        num_files: Number of file hashes to generate
-        start_offset: Starting index for hash generation (prevents conflicts)
+        num_files: Either an int (single group, that many files) or a
+            list[int] of per-group file counts. In the multi-group case
+            keys are ordered group-by-group so they match the block_ids
+            layout in GPULoadStoreSpec (all group 0 keys first, then
+            group 1, etc.).
+        start_offset: Starting index for hash generation (prevents conflicts).
     """
-    ranges = [
-        (100 + (start_offset + i) * 100, 117 + (start_offset + i) * 100)
-        for i in range(num_files)
-    ]
-    keys = [
-        make_offload_key(get_prefix_hash_bytes(range(a, b)), 0) for (a, b) in ranges
-    ]
+    if isinstance(num_files, int):
+        num_files = [num_files]
+    keys: list[OffloadKey] = []
+    offset = start_offset
+    for group_idx, n in enumerate(num_files):
+        for i in range(n):
+            a = 100 + (offset + i) * 100
+            b = 117 + (offset + i) * 100
+            keys.append(get_offload_key(range(a, b), group_idx=group_idx))
+        offset += n
     return SharedStorageLoadStoreSpec(keys), keys
 
 
 def cleanup_files(
     file_mapper: FileMapper,
-    block_hashes: list[OffloadKey],
+    keys: list[OffloadKey],
 ) -> None:
-    """Remove existing files for the provided block hashes."""
-    for h in block_hashes:
-        path = file_mapper.get_file_name(h)
+    """Remove existing files for the provided offload keys."""
+    for key in keys:
+        path = file_mapper.get_file_name(key)
         if os.path.exists(path):
             os.remove(path)
 
@@ -178,27 +239,12 @@ def total_block_size_mb(
     return (per_block_bytes * num_blocks) / (1024 * 1024)
 
 
-def log_file_info(
-    base_path: str,
-    block_hashes: list[OffloadKey],
-) -> tuple[int, list[float]]:
-    """Log information about the files corresponding to the given block hashes."""
-    file_sizes = []
-    for h in block_hashes:
-        path = StorageOffloadingHandlers.get_file_name(base_path, h)
-        if os.path.exists(path):
-            size_mb = os.path.getsize(path) / (1024 * 1024)
-            file_sizes.append(size_mb)
-    num_files = len(file_sizes)
-    return num_files, file_sizes
-
-
 def wait_for(
     handler,
     job_id: int,
     timeout: float = 2.0,
     _finished_cache: dict = None,
-) -> bool:
+):
     """
     Wait for a specific job in handler.get_finished() up to timeout seconds.
 
@@ -211,7 +257,7 @@ def wait_for(
             jobs from the map and we need to remember them across calls.
 
     Returns:
-        True if job succeeded, False if it failed
+        The TransferResult for the completed job.
     """
     # If no cache provided, create a local one (for backward compatibility)
     if _finished_cache is None:
@@ -224,10 +270,10 @@ def wait_for(
     while time.time() - start < timeout:
         finished = handler.get_finished()
         for result in finished:
-            # Cache ALL finished jobs we see (important when handlers share an engine)
-            _finished_cache[result.job_id] = result.success
+            # Cache ALL finished results (important when handlers share an engine)
+            _finished_cache[result.job_id] = result
             if result.job_id == job_id:
-                return result.success
+                return result
         time.sleep(0.01)  # avoid busy-spin
 
     raise TimeoutError(
@@ -250,6 +296,12 @@ def roundtrip_once(
     write_block_ids: list[int],
     gpu_blocks_per_file: int,
     threads_per_gpu: int,
+    num_groups: int = 1,
+    extra_config: dict | None = None,
+    handlers_cls=StorageOffloadingHandlers,
+    wait_timeout: float = 2.0,
+    cleanup: bool = True,
+    file_exists_fn=None,
 ):
     original = create_dummy_kv_tensors(
         num_layers, num_blocks, block_size, num_heads, head_size, dtype
@@ -258,54 +310,69 @@ def roundtrip_once(
 
     put_gpu_specs = make_gpu_specs(write_block_ids)
     put_num_files = math.ceil(len(write_block_ids) / gpu_blocks_per_file)
-    put_storage_specs, block_hashes = make_storage_specs(put_num_files)
-    cleanup_files(file_mapper, block_hashes)
+    put_storage_specs, keys = make_storage_specs(put_num_files)
+    cleanup_files(file_mapper, keys)
 
-    kv_caches_original = make_canonical_kv_caches(original)
-    kv_caches_restored = make_canonical_kv_caches(restored)
+    # Build CanonicalKVCaches from test tensors
+    canonical_original = make_canonical_kv_caches(original, num_groups)
+    canonical_restored = make_canonical_kv_caches(restored, num_groups)
 
     # PUT phase
-    kv_caches_original_handler = StorageOffloadingHandlers(
+    kv_caches_original_handler = handlers_cls(
         file_mapper=file_mapper,
-        kv_caches=kv_caches_original,
+        kv_caches=canonical_original,
         gpu_blocks_per_file=gpu_blocks_per_file,
         gpu_block_size=gpu_block_size,
         threads_per_gpu=threads_per_gpu,
+        extra_config=extra_config,
     )
     put_handler = kv_caches_original_handler.gpu_to_storage_handler
     start_put = time.time()
     put_handler.transfer_async(job_id=1, spec=(put_gpu_specs, put_storage_specs))
-    ok_put = wait_for(put_handler, job_id=1, timeout=2.0)
-    assert ok_put, "PUT failed"
+    put_result = wait_for(put_handler, job_id=1, timeout=wait_timeout)
+    assert put_result.success, "PUT failed"
     dur_put = time.time() - start_put
-    for h in block_hashes:
-        file_path = file_mapper.get_file_name(h)
-        assert wait_for_file(file_path, timeout=2.0), (
-            f"missing file after PUT: {file_path}"
-        )
+
+    # Verify PUT metrics fields
+    assert put_result.transfer_size is not None and put_result.transfer_size > 0
+    assert put_result.transfer_time is not None and put_result.transfer_time > 0
+    assert put_result.transfer_type == ("GPU", "SHARED_STORAGE")
+    check_exists = file_exists_fn or (lambda p: wait_for_file(p, timeout=2.0))
+    for key in keys:
+        file_path = file_mapper.get_file_name(key)
+        assert check_exists(file_path), f"missing file after PUT: {file_path}"
 
     # GET phase
-    kv_caches_restored_handler = StorageOffloadingHandlers(
+    kv_caches_restored_handler = handlers_cls(
         file_mapper=file_mapper,
-        kv_caches=kv_caches_restored,
+        kv_caches=canonical_restored,
         gpu_blocks_per_file=gpu_blocks_per_file,
         threads_per_gpu=threads_per_gpu,
         gpu_block_size=gpu_block_size,
+        extra_config=extra_config,
     )
     get_handler = kv_caches_restored_handler.storage_to_gpu_handler
 
-    get_gpu_specs = make_gpu_specs(read_block_ids, block_indices=[read_block_ids[0]])
-    read_offset = read_block_ids[0] % gpu_blocks_per_file
-    get_num_files = math.ceil((len(read_block_ids) + read_offset) / gpu_blocks_per_file)
-    start_index = read_block_ids[0] // gpu_blocks_per_file
+    # Logical start of the suffix read; backend uses it via block_indices.
+    read_start_idx = read_block_ids[0] - write_block_ids[0]
+    get_gpu_specs = make_gpu_specs(read_block_ids, block_indices=[read_start_idx])
+    # Files covered by the read span = [start//gpb, end//gpb] (inclusive).
+    read_end_idx = read_start_idx + len(read_block_ids)  # exclusive
+    first_file = read_start_idx // gpu_blocks_per_file
+    last_file = (read_end_idx - 1) // gpu_blocks_per_file
     get_storage_spec = SharedStorageLoadStoreSpec(
-        put_storage_specs.keys[start_index : start_index + get_num_files]
+        put_storage_specs.keys[first_file : last_file + 1]
     )
     start_get = time.time()
     get_handler.transfer_async(job_id=2, spec=(get_storage_spec, get_gpu_specs))
-    ok_get = wait_for(get_handler, job_id=2, timeout=2.0)
+    get_result = wait_for(get_handler, job_id=2, timeout=wait_timeout)
     dur_get = time.time() - start_get
-    assert ok_get, "GET failed"
+    assert get_result.success, "GET failed"
+
+    # Verify GET metrics fields
+    assert get_result.transfer_size is not None and get_result.transfer_size > 0
+    assert get_result.transfer_time is not None and get_result.transfer_time > 0
+    assert get_result.transfer_type == ("SHARED_STORAGE", "GPU")
     assert_blocks_equal(original, restored, read_block_ids)
 
     # Report
@@ -315,16 +382,20 @@ def roundtrip_once(
     read_total_mb = total_block_size_mb(
         num_layers, num_heads, block_size, head_size, dtype, len(read_block_ids)
     )
-    file_size_mb = os.path.getsize(file_mapper.get_file_name(block_hashes[0])) / (
-        1024 * 1024
-    )
-    num_files = len(block_hashes)
+    num_files = len(keys)
+    try:
+        file_size_mb = os.path.getsize(file_mapper.get_file_name(keys[0])) / (
+            1024 * 1024
+        )
+        size_info = f" file_size={file_size_mb:.2f}MB"
+    except OSError:
+        size_info = ""
     print(
         f"[INFO] group={gpu_blocks_per_file} write blocks len: "
         f"{len(write_block_ids)} read blocks len: {len(read_block_ids)} "
         f"PUT {dur_put:.4f}s ({throughput_gbps(write_total_mb, dur_put):.2f} GB/s), "
         f"GET {dur_get:.4f}s ({throughput_gbps(read_total_mb, dur_get):.2f} GB/s), "
-        f"files={num_files}, sizes(MB)={file_size_mb:.2f} "
+        f"files={num_files}{size_info}"
     )
 
 
@@ -370,13 +441,14 @@ def test_fs_backend_roundtrip_param(
     file_mapper = FileMapper(
         root_dir=root_dir,
         model_name=model_name,
-        gpu_block_size=gpu_block_size,
+        hash_block_size=gpu_block_size,
         gpu_blocks_per_file=gpu_blocks_per_file,
         tp_size=tp_size,
         pp_size=tp_size,
         pcp_size=tp_size,
+        dcp_size=1,
         rank=tp_rank,
-        dtype=dtype,
+        dtype=str(dtype),
     )
     roundtrip_once(
         file_mapper=file_mapper,

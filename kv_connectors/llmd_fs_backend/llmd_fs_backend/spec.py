@@ -14,12 +14,15 @@
 
 from collections.abc import Iterator
 
-import torch
 from vllm.config import VllmConfig
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.kv_offload.abstract import LoadStoreSpec, OffloadingManager
-from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
-from vllm.v1.kv_offload.spec import CanonicalKVCaches, OffloadingSpec
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    GPULoadStoreSpec,
+    LoadStoreSpec,
+    OffloadingManager,
+    OffloadingSpec,
+)
 from vllm.v1.kv_offload.worker.worker import OffloadingHandler
 
 from llmd_fs_backend.file_mapper import FileMapper
@@ -27,6 +30,7 @@ from llmd_fs_backend.manager import SharedStorageOffloadingManager
 from llmd_fs_backend.mediums import SharedStorageLoadStoreSpec
 from llmd_fs_backend.worker import (
     DEFAULT_MAX_STAGING_MEMORY_GB,
+    DEFAULT_MAX_WRITE_QUEUED_SECONDS,
     DEFAULT_READ_PREFERRING_WORKERS_RATIO,
     DEFAULT_THREADS_PER_GPU,
     StorageOffloadingHandlers,
@@ -62,28 +66,23 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         self.offloaded_block_size = int(
             self.extra_config.get("block_size", DEFAULT_STORAGE_BLOCK_SIZE)
         )
-        self.use_odirect = bool(self.extra_config.get("use_odirect", False))
 
-        # gpu_block_size is a tuple (one per KV cache group); all groups must
-        # have the same block size for shared-storage offloading.
-        gpu_block_sizes = set(self.gpu_block_size)
-        assert len(gpu_block_sizes) == 1, (
-            "SharedStorageOffloadingSpec requires all KV cache groups to have "
-            "the same GPU block size"
+        # hash_block_size = GCD of all groups' block sizes (the granularity at
+        # which Request.block_hashes are computed); use it instead of
+        # cache_config.block_size which can be larger on hybrid models (e.g. DSv4).
+        assert self.offloaded_block_size % self.hash_block_size == 0, (
+            "offloaded_block_size must be a multiple of hash_block_size"
         )
-        self._single_gpu_block_size: int = gpu_block_sizes.pop()
-
-        assert self.offloaded_block_size % self._single_gpu_block_size == 0, (
-            "offloaded_block_size must be a multiple of gpu_block_size"
-        )
-        self.gpu_blocks_per_file = (
-            self.offloaded_block_size // self._single_gpu_block_size
-        )
-        self.block_size_factor = self.gpu_blocks_per_file
+        self.gpu_blocks_per_file = self.offloaded_block_size // self.hash_block_size
 
         self.read_preferring_ratio = float(
             self.extra_config.get(
                 "read_preferring_ratio", DEFAULT_READ_PREFERRING_WORKERS_RATIO
+            )
+        )
+        self.max_write_queued_seconds = float(
+            self.extra_config.get(
+                "max_write_queued_seconds", DEFAULT_MAX_WRITE_QUEUED_SECONDS
             )
         )
 
@@ -93,24 +92,32 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         pcp_size = parallel_config.prefill_context_parallel_size
         assert parallel_config.world_size == tp_size * pp_size * pcp_size
 
-        # TODO: use dtype from KVCacheConfig instead of VllmConfig.CacheConfig
-        dtype = str(vllm_config.cache_config.cache_dtype).replace("torch.", "")
-        self.file_mapper = FileMapper(
+        self.file_mapper = FileMapper.from_vllm_config(
             root_dir=shared_storage_path,
-            model_name=vllm_config.model_config.model,
-            gpu_block_size=self._single_gpu_block_size,
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
             gpu_blocks_per_file=self.gpu_blocks_per_file,
-            tp_size=tp_size,
-            pp_size=pp_size,
-            pcp_size=pcp_size,
-            rank=parallel_config.rank,
-            dtype=dtype,
         )
+        self.file_mapper.write_run_config()
 
     def get_manager(self) -> OffloadingManager:
         assert self.vllm_config.parallel_config.rank == 0, "Scheduler rank should be 0"
         if not self._manager:
-            self._manager = SharedStorageOffloadingManager(file_mapper=self.file_mapper)
+            backend = self.extra_config.get("backend", "POSIX")
+            if backend == "OBJ":
+                from llmd_nixl.manager import NixlStorageOffloadingManager
+
+                self.extra_config.setdefault("storage_medium", "OBJECT_STORE")
+                self._manager = NixlStorageOffloadingManager(
+                    file_mapper=self.file_mapper,
+                    extra_config=self.extra_config,
+                )
+            else:
+                self.extra_config.setdefault("storage_medium", "SHARED_STORAGE")
+                self._manager = SharedStorageOffloadingManager(
+                    file_mapper=self.file_mapper,
+                    extra_config=self.extra_config,
+                )
         return self._manager
 
     def get_handlers(
@@ -118,14 +125,23 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         kv_caches: CanonicalKVCaches,
     ) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]:
         if not self._handlers:
-            self._handlers = StorageOffloadingHandlers(
+            backend = self.extra_config.get("backend", "POSIX")
+            if backend == "OBJ":
+                from llmd_nixl.worker import NixlStorageOffloadingHandlers
+
+                handlers_cls = NixlStorageOffloadingHandlers
+            else:
+                handlers_cls = StorageOffloadingHandlers
+            self._handlers = handlers_cls(
                 file_mapper=self.file_mapper,
                 gpu_blocks_per_file=self.gpu_blocks_per_file,
-                gpu_block_size=self._single_gpu_block_size,
+                gpu_block_size=self.hash_block_size,
                 kv_caches=kv_caches,
                 threads_per_gpu=self.threads_per_gpu,
                 max_staging_memory_gb=self.max_staging_memory_gb,
-                use_odirect=self.use_odirect,
+                read_preferring_ratio=self.read_preferring_ratio,
+                max_write_queued_seconds=self.max_write_queued_seconds,
+                extra_config=self.extra_config,
             )
 
         assert self._handlers is not None

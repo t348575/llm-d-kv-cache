@@ -16,7 +16,6 @@
 
 #include <torch/extension.h>
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 
 #include "storage_offload.hpp"
 
@@ -29,69 +28,92 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "StorageOffloadEngine",
       "Engine for asynchronous KV-cache offloading between GPU memory "
       "and shared storage using background I/O threads.")
-      .def(py::init<int, int, std::vector<torch::Tensor>&, int, bool>(),
+      .def(py::init<int,
+                    int,
+                    std::vector<torch::Tensor>&,
+                    std::vector<std::vector<int64_t>>,
+                    std::vector<int64_t>,
+                    int,
+                    const std::string&,
+                    float>(),
            py::arg("io_threads"),
            py::arg("gpu_blocks_per_file"),
            py::arg("tensors"),
+           py::arg("group_tensor_indices"),
+           py::arg("per_group_block_bytes"),
            py::arg("read_preferring_workers"),
-           py::arg("use_odirect") = false,
+           py::arg("gds_mode") = "disabled",
+           py::arg("max_write_queued_seconds"),
+
            "Create a StorageOffloadEngine instance for asynchronous KV-cache "
-           "transfers "
-           "between GPU memory and shared storage. "
+           "transfers between GPU memory and shared storage. "
            "This initializes background I/O threads, per-thread CPU staging "
-           "buffers, "
-           "and dedicated CUDA streams for async copy operations. "
+           "buffers, and dedicated CUDA streams for async copy operations. "
            "The current CUDA device must already be set by the caller, and all "
-           "tensors "
-           "are expected to reside on that device. "
+           "tensors are expected to reside on that device. "
            "CPU staging memory is NUMA-aware and prefers the NUMA node local "
-           "to the GPU "
-           "to improve data locality and performance.\n\n"
+           "to the GPU to improve data locality and performance.\n\n"
            "Args:\n"
            "  io_threads: Number of background I/O worker threads.\n"
            "  gpu_blocks_per_file: Number of GPU KV-cache blocks per file.\n"
-           "  tensors: List of GPU tensors backing the KV-cache.\n"
+           "  tensors: Flat list of canonical GPU tensors backing the "
+           "KV-cache.\n"
+           "  group_tensor_indices: Per-KV-cache-group list of tensor indices "
+           "into `tensors`. For single-group models, pass a single list "
+           "covering all tensors.\n"
+           "  per_group_block_bytes: Bytes per block per group "
+           "(CanonicalKVCacheRef.page_size_bytes); sizes the staging buffer.\n"
            "  read_preferring_workers: Number of workers that check "
-           "read queue first (calculated as int(io_threads * read_ratio) "
-           "in Python)..\n"
-           "  use_odirect: If True, open files with O_DIRECT to bypass the "
-           "page cache. Requires page-aligned staging buffers (guaranteed by "
-           "cudaHostAlloc) and transfer sizes that are multiples of 512 bytes "
-           "(guaranteed by KV cache geometry). Default: False.")
+           "  read queue first (calculated as int(io_threads * read_ratio) "
+           "  gds_mode: GDS operation mode (see GdsMode in storage_types.hpp). "
+           "Defaults to 'disabled'.\n"
+           "  max_write_queued_seconds: Max seconds of queued writes before "
+           "dropping. 0 disables the limit.\n")
 
       .def("get_finished",
            &StorageOffloadEngine::get_finished,
-            "Return a list of finished jobs with per-phase timing.\n\n"
-            "Each entry is a tuple:\n"
-            "  (job_id, success, num_bytes, file_io_samples, cuda_copy_samples)\n\n"
-            "  job_id: the job identifier\n"
-            "  success: True if all tasks succeeded\n"
-            "  num_bytes: total bytes transferred across all tasks\n"
-            "  file_io_samples: list of (start_ns, duration_ns, num_bytes)\n"
-            "  cuda_copy_samples: list of (start_ns, duration_ns, num_bytes)")
+           "Return a list of finished job IDs and their success status.\n\n"
+           "Each entry is a (job_id, success) tuple.")
 
       .def("async_store_gpu_blocks",
            &StorageOffloadEngine::async_store_gpu_blocks,
            py::arg("job_id"),
+           py::arg("group_indices"),
            py::arg("dst_files"),
            py::arg("all_block_ids"),
+           py::arg("head_offsets"),
            "Asynchronously store GPU KV-cache blocks to shared storage.\n\n"
            "Args:\n"
            "  job_id: Identifier for the async job.\n"
+           "  group_indices: Per-file KV cache group index. group_indices[i] "
+           "selects the tensor subset (from `group_tensor_indices` passed at "
+           "init) to copy from the GPU for dst_files[i]. For a single-group "
+           "model this is always [0, 0, ..., 0] (single group 0).\n"
            "  dst_files: Destination file paths.\n"
-           "  all_block_ids: KV-cache block IDs per file.")
+           "  all_block_ids: KV-cache block IDs per file.\n"
+           "  head_offsets: Per-file slot offset (in GPU blocks) where this "
+           "group's data starts. Non-zero only for the first file of a "
+           "head-partial group; 0 otherwise.")
 
       .def("async_load_gpu_blocks",
            &StorageOffloadEngine::async_load_gpu_blocks,
            py::arg("job_id"),
+           py::arg("group_indices"),
            py::arg("src_files"),
            py::arg("all_block_ids"),
+           py::arg("head_offsets"),
            "Asynchronously load KV-cache blocks from shared storage into "
            "GPU.\n\n"
            "Args:\n"
            "  job_id: Identifier for the async job.\n"
+           "  group_indices: Per-file KV cache group index. group_indices[i] "
+           "selects the tensor subset (from `group_tensor_indices` passed at "
+           "init) to copy into on the GPU for src_files[i]. For a single-group "
+           "model this is always [0, 0, ..., 0] (single group 0).\n"
            "  src_files: Source file paths.\n"
-           "  all_block_ids: KV-cache block IDs per file.")
+           "  all_block_ids: KV-cache block IDs per file.\n"
+           "  head_offsets: Per-file slot offset (in GPU blocks) where this "
+           "group's data lives. Must match the value used at write time.")
 
       .def("wait_job",
            &StorageOffloadEngine::wait_job,

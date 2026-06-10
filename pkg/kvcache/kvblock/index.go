@@ -127,13 +127,38 @@ type Index interface {
 	// 1. A map where the keys are those in requestKeys and the values are pod-identifiers.
 	// 2. An error if any occurred during the operation.
 	Lookup(ctx context.Context, requestKeys []BlockHash, podIdentifierSet sets.Set[string]) (map[BlockHash][]PodEntry, error)
-	// Add adds a set of engineKeys/requestKeys and their associated pod entries to the index backend.
+	// Add stores requestKey -> pod entries and (optionally) engineKey -> requestKey
+	// mappings. If engineKeys is nil, only requestKey -> pod mappings are created
+	// (used for speculative entries where engine keys are not yet known).
+	//
+	// When engineKeys is non-nil, the backend infers the mapping from the ratio
+	// of len(engineKeys) to len(requestKeys). Both lengths derive from the same
+	// token count divided by their respective block sizes, so they always divide
+	// evenly. Examples with 256 tokens:
+	//
+	//   1:1   (engine=64, canonical=64)  -> 4 eng, 4 req  -> E0->R0, E1->R1, ...
+	//   many:1 (engine=16, canonical=64) -> 16 eng, 4 req -> E0..E3->R0, E4..E7->R1, ...
+	//   1:many (engine=128, canonical=64) -> 2 eng, 4 req -> E0->[R0,R1], E1->[R2,R3]
 	Add(ctx context.Context, engineKeys, requestKeys []BlockHash, entries []PodEntry) error
-	// Evict removes an engineKey and its associated pod entries from the index backend.
-	Evict(ctx context.Context, engineKey BlockHash, entries []PodEntry) error
+	// Evict removes a key and its associated pod entries from the index backend.
+	// keyType indicates whether the key is an EngineKey (requires engine→request lookup)
+	// or a RequestKey (used directly).
+	Evict(ctx context.Context, key BlockHash, keyType KeyType, entries []PodEntry) error
 	// GetRequestKey returns the requestKey associated with the given engineKey.
 	GetRequestKey(ctx context.Context, engineKey BlockHash) (BlockHash, error)
 }
+
+// KeyType indicates whether a key passed to Evict is an engine key or a request key.
+type KeyType int
+
+const (
+	// EngineKey means the key is an engine-assigned key that must be resolved
+	// to a request key via the engineToRequestKeys mapping.
+	EngineKey KeyType = iota
+	// RequestKey means the key is a request key and can be used directly.
+	// This is used for speculative entries that were added without engineKey mapping.
+	RequestKey
+)
 
 // BlockHash struct represents a unique identifier for a KV-cache block.
 type BlockHash uint64
@@ -153,9 +178,22 @@ type PodEntry struct {
 	PodIdentifier string
 	// DeviceTier is the tier of the device where the KV-block is stored.
 	DeviceTier string
+	// Speculative indicates the entry was added predictively before a KV event confirmed it.
+	Speculative bool
+	// HasGroup indicates GroupIdx identifies a vLLM KV cache group.
+	HasGroup bool
+	// GroupIdx identifies the vLLM KV cache group for HMA events.
+	GroupIdx GroupID
 }
 
 // String returns a string representation of the PodEntry.
 func (e *PodEntry) String() string {
-	return fmt.Sprintf("%s@%s", e.PodIdentifier, e.DeviceTier)
+	suffix := ""
+	if e.Speculative {
+		suffix = "[speculative]"
+	}
+	if e.HasGroup {
+		suffix += fmt.Sprintf("[group=%d]", e.GroupIdx)
+	}
+	return fmt.Sprintf("%s@%s%s", e.PodIdentifier, e.DeviceTier, suffix)
 }

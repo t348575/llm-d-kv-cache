@@ -73,12 +73,8 @@ Thumbs.db
 /config.yaml
 /config.json
 
-# cgo build output (if any)
-*.a
-*.o
-*.cgo1.go
-*.cgo2.c
-_cgo_*
+# cuFile deployment config (contains deployment-specific RDMA NIC IPs)
+cufile.json
 
 # Gopls and tools
 .gopls/
@@ -87,5 +83,6 @@ _cgo_*
 # uds tokenizer default tokenizer cache path
 services/uds_tokenizer/tokenizers
 services/uds_tokenizer/.venv
+kv_connectors/llmd_fs_backend/.venv
 
 **/vllm_source

@@ -116,7 +116,7 @@ ThreadPool::ThreadPool(size_t threads,
       // Round-robin CPUs within the NUMA node
       // TODO: Re-evaluate whether strict NUMA-based round-robin CPU
       // assignment is optimal for performance.
-      int cpu_id = local_cpus[i % local_cpus.size()];
+      int cpu_id = local_cpus[(i + device_id * threads) % local_cpus.size()];
 
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
@@ -224,8 +224,9 @@ at::cuda::CUDAStream& ThreadPool::get_tls_stream() { return m_thread_stream; }
 
 // Allocate the thread-local staging buffer to at least required_bytes
 bool ThreadPool::allocate_staging_buffer(size_t required_bytes) {
+  size_t alloc_size = required_bytes;
   cudaError_t err = cudaHostAlloc(&m_staging_buffer.ptr,
-                                  required_bytes,
+                                  alloc_size,
                                   cudaHostAllocMapped | cudaHostAllocPortable);
 
   if (err != cudaSuccess) {
@@ -235,12 +236,18 @@ bool ThreadPool::allocate_staging_buffer(size_t required_bytes) {
     return false;
   }
 
-  m_staging_buffer.size = required_bytes;
+  m_staging_buffer.size = alloc_size;
   FS_LOG_DEBUG("Thread " << std::this_thread::get_id()
                          << " allocated staging buffer "
-                         << (required_bytes / (1024 * 1024)) << " MB");
+                         << (alloc_size / (1024 * 1024)) << " MB");
   return true;
 }
 
 // Return the thread-local staging buffer
 StagingBufferInfo& ThreadPool::get_staging_buffer() { return m_staging_buffer; }
+
+// Return current write (normal priority) queue depth
+size_t ThreadPool::normal_queue_size() const {
+  std::lock_guard<std::mutex> lock(m_queue_mutex);
+  return m_normal_tasks.size();
+}

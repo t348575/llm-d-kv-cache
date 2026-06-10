@@ -1,4 +1,4 @@
-//go:build exclude && embedded_tokenizers
+//go:build exclude
 
 /*
 Copyright 2025 The llm-d Authors.
@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/jellydator/ttlcache/v3"
@@ -75,14 +74,6 @@ func PrecisePrefixCachePluginFactory(name string, rawParameters json.RawMessage,
 		KVEventsConfig: kvevents.DefaultConfig(),
 	}
 
-	// read hugging face token from environment variable if set
-	if token := os.Getenv("HF_TOKEN"); token != "" &&
-		parameters.IndexerConfig != nil &&
-		parameters.IndexerConfig.TokenizersPoolConfig != nil &&
-		parameters.IndexerConfig.TokenizersPoolConfig.HFTokenizerConfig != nil {
-		parameters.IndexerConfig.TokenizersPoolConfig.HFTokenizerConfig.HuggingFaceToken = token
-	}
-
 	if rawParameters != nil {
 		if err := json.Unmarshal(rawParameters, &parameters); err != nil {
 			return nil, fmt.Errorf("failed to parse %s plugin config: %w", PrecisePrefixCachePluginType, err)
@@ -108,7 +99,10 @@ func PrecisePrefixCachePluginFactory(name string, rawParameters json.RawMessage,
 // an error is returned.
 func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePrefixCacheScorer, error) {
 	// initialize the indexer
-	tokenProcessor := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
+	tokenProcessor, err := kvblock.NewChunkedTokenDatabase(config.TokenProcessorConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create token processor: %w", err)
+	}
 
 	kvCacheIndexer, err := kvcache.NewKVCacheIndexer(ctx, config.IndexerConfig, tokenProcessor)
 	if err != nil {
@@ -118,7 +112,12 @@ func New(ctx context.Context, config PrecisePrefixCachePluginConfig) (*PrecisePr
 	go kvCacheIndexer.Run(ctx)
 
 	// initialize the KV-events pool
-	pool := kvevents.NewPool(config.KVEventsConfig, kvCacheIndexer.KVBlockIndex(), tokenProcessor, engineadapter.NewVLLMAdapter())
+	adapter, err := engineadapter.NewAdapter(config.KVEventsConfig.EngineType)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create engine adapter: %w", err)
+	}
+
+	pool := kvevents.NewPool(config.KVEventsConfig, kvCacheIndexer.KVBlockIndex(), tokenProcessor, adapter)
 	pool.Start(ctx)
 
 	subscribersManager := kvevents.NewSubscriberManager(pool)
@@ -285,8 +284,9 @@ func (s *PrecisePrefixCacheScorer) getScores(ctx context.Context, request *types
 		// Convert messages to the format expected by the renderer
 		for _, msg := range request.Body.ChatCompletions.Messages {
 			renderReq.Conversation = append(renderReq.Conversation, types.Conversation{
-				Role:    msg.Role,
-				Content: msg.Content.Raw,
+				Role:      msg.Role,
+				Content:   types.Content{Raw: msg.Content.Raw},
+				ToolCalls: msg.ToolCalls,
 			})
 		}
 

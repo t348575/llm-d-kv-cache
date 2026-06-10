@@ -39,9 +39,15 @@ type mockTokenProcessor struct {
 	receivedTokens []uint32
 }
 
-func (m *mockTokenProcessor) TokensToKVBlockKeys(_ kvblock.BlockHash, tokens []uint32, _ string) []kvblock.BlockHash {
+func (m *mockTokenProcessor) TokensToKVBlockKeys(
+	_ kvblock.BlockHash, tokens []uint32, _ string, _ []*kvblock.BlockExtraFeatures,
+) ([]kvblock.BlockHash, error) {
 	m.receivedTokens = tokens
-	return m.blockKeys
+	return m.blockKeys, nil
+}
+
+func (m *mockTokenProcessor) BlockSize() int {
+	return 16
 }
 
 // mockTokenizersPool implements kvcache.TokenizersPool for testing.
@@ -49,8 +55,8 @@ type mockTokenizersPool struct {
 	tokens []uint32
 }
 
-func (m *mockTokenizersPool) Tokenize(_ *types.RenderChatRequest, _ string) []uint32 {
-	return m.tokens
+func (m *mockTokenizersPool) Tokenize(_ *types.RenderChatRequest, _ string) ([]uint32, *tokenization.MultiModalFeatures) {
+	return m.tokens, nil
 }
 
 func (m *mockTokenizersPool) Run(_ context.Context) {}
@@ -273,7 +279,7 @@ func TestScoreTokens(t *testing.T) {
 				populateIndex(t, indexer.KVBlockIndex(), tt.indexEntries)
 			}
 
-			scores, err := indexer.ScoreTokens(ctx, tt.tokens, testModel, tt.podIdentifiers)
+			scores, err := indexer.ScoreTokens(ctx, tt.tokens, testModel, tt.podIdentifiers, nil)
 			assertScores(t, &tt, scores, err)
 		})
 	}

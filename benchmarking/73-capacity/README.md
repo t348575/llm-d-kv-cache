@@ -110,7 +110,6 @@ plugins:
   - type: single-profile-handler
   - type: prefix-cache-scorer
     parameters:
-      hashBlockSize: 64
       maxPrefixBlocksToMatch: 256
       lruCapacityPerServer: 31250
   - type: kv-cache-scorer
@@ -161,7 +160,7 @@ plugins:
   parameters:
     mode: cache_tracking
     tokenProcessorConfig:
-      blockSize: 64   
+      blockSizeTokens: 64
       hashSeed: "42"
     indexerConfig:
       kvBlockIndexConfig:

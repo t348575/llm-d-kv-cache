@@ -95,16 +95,24 @@ linters:
         - w http.ResponseWriter
         - r *http.Request
   exclusions:
-    generated: lax
+    generated: strict
     presets:
       - comments
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      # Examples and UDS e2e tests intentionally exercise the deprecated
+      # internal-tokenization path during the deprecation window of #517.
+      - path: '^(examples/|tests/e2e/uds_tokenizer/)'
+        linters: [staticcheck]
+        text: '^SA1019'
     paths:
       - third_party$
       - builtin$
       - examples$
+      - \.pb\.go$
+      - _grpc\.pb\.go$
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
@@ -115,8 +123,10 @@ formatters:
     - gofumpt
     - goimports
   exclusions:
-    generated: lax
+    generated: strict
     paths:
       - third_party$
       - builtin$
       - examples$
+      - \.pb\.go$
+      - _grpc\.pb\.go$

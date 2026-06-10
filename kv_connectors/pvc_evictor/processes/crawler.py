@@ -1,24 +1,16 @@
 """Crawler process for discovering and queuing cache files."""
 
-import os
-import time
+import contextlib
 import logging
 import multiprocessing
-import re
+import os
+import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional, Iterator, List, Tuple
+from typing import Any
 
-from utils.system import setup_logging
 from utils.logging_helpers import send_stats_to_queue
-
-# FileMapper integration for canonical cache structure
-try:
-    from llmd_fs_backend.file_mapper import FileMapper
-
-    FILEMAPPER_AVAILABLE = True
-except ImportError:
-    FILEMAPPER_AVAILABLE = False
-    FileMapper = None
+from utils.system import setup_logging
 
 # Module-level logger for functions
 logger = logging.getLogger(__name__)
@@ -46,7 +38,7 @@ def safe_scandir(path: str) -> Iterator[os.DirEntry]:
         return iter([])
 
 
-def hex_to_int(hex_str: str) -> Optional[int]:
+def hex_to_int(hex_str: str) -> int | None:
     """Convert hex string to integer."""
     try:
         return int(hex_str, 16)
@@ -54,37 +46,7 @@ def hex_to_int(hex_str: str) -> Optional[int]:
         return None
 
 
-def parse_filemapper_params(dir_name: str, pattern: str) -> dict:
-    """
-    Parse FileMapper parameters from directory name.
-
-    Examples:
-        parse_filemapper_params("block_size_16_blocks_per_file_256",
-                               "block_size_{gpu_block_size}_blocks_per_file_{gpu_blocks_per_file}")
-        -> {"gpu_block_size": 16, "gpu_blocks_per_file": 256}
-    """
-    # Convert pattern to regex, replacing {X} with named capture groups
-    regex_pattern = pattern
-    param_names = re.findall(r"\{(\w+)\}", pattern)
-
-    for param in param_names:
-        regex_pattern = regex_pattern.replace(f"{{{param}}}", f"(?P<{param}>\\d+)")
-
-    match = re.match(regex_pattern, dir_name)
-    if not match:
-        return {}
-
-    # Convert matched values to integers
-    result = {}
-    for param in param_names:
-        value = match.group(param)
-        if value:
-            result[param] = int(value)
-
-    return result
-
-
-def get_hex_modulo_ranges(num_processes: int = 8) -> List[Tuple[int, int]]:
+def get_hex_modulo_ranges(num_processes: int = 8) -> list[tuple[int, int]]:
     """
     Get hex modulo ranges for each crawler process.
 
@@ -103,9 +65,7 @@ def get_hex_modulo_ranges(num_processes: int = 8) -> List[Tuple[int, int]]:
 
     valid_counts = [2**i for i in range(int(math.log2(HEX_MODULO_BASE)) + 1)]
     if num_processes not in valid_counts:
-        raise ValueError(
-            f"NUM_CRAWLER_PROCESSES must be a power of 2 from 1 to {HEX_MODULO_BASE}, got {num_processes}"
-        )
+        raise ValueError(f"NUM_CRAWLER_PROCESSES must be a power of 2 from 1 to {HEX_MODULO_BASE}, got {num_processes}")
 
     ranges = []
     values_per_process = HEX_MODULO_BASE // num_processes
@@ -118,160 +78,167 @@ def get_hex_modulo_ranges(num_processes: int = 8) -> List[Tuple[int, int]]:
     return ranges
 
 
-def stream_cache_files_with_mapper(
-    cache_path: Path, hex_modulo_range: Optional[Tuple[int, int]] = None
-) -> Iterator[Path]:
+def _iter_rank_dirs(cache_path: Path) -> Iterator[os.DirEntry]:
     """
-    Stream cache files using FileMapper structure for canonical traversal.
+    Recursively yield directories that directly contain first-level hex buckets.
 
-    This function streams through FileMapper configurations in the cache directory
-    and uses FileMapper.base_path to traverse the canonical structure:
-
-    {model}/block_size_{X}_blocks_per_file_{Y}/tp_{tp}_pp_size_{pp}_pcp_size_{pcp}/
-    rank_{rank}/{dtype}/{hhh}/{hh}/*.bin
-
-    Yields path objects for .bin files in FileMapper structure
+    Supports both:
+    - New layout: <root>/<safe_model_name>_<sha256>_r<rank>/<hhh>/
+    - Old layout: <root>/<model>/.../rank_<rank>/<dtype>/<hhh>/
     """
-    if not cache_path.exists():
-        logger.warning(f"FileMapper: cache_path does not exist: {cache_path}")
-        return
-
-    if not FILEMAPPER_AVAILABLE:
-        # FileMapper not available - this should not happen if properly configured
-        # Fall back to vLLM structure
-        logger.warning("FileMapper: FILEMAPPER_AVAILABLE is False")
-        return
-
-    modulo_range_min, modulo_range_max = (
-        hex_modulo_range if hex_modulo_range else (0, 15)
-    )
-
-    # Iterate through models
-    for model_dir in safe_scandir(str(cache_path)):
-        if not model_dir.is_dir():
-            continue
-
-        model_name = model_dir.name
-
-        # Iterate through block_size_*_blocks_per_file_* directories
-        for block_config_dir in Path(model_dir.path).glob(
-            "block_size_*_blocks_per_file_*"
-        ):
-            if not block_config_dir.is_dir():
+    stack: list[str] = [str(cache_path)]
+    while stack:
+        current = stack.pop()
+        for entry in safe_scandir(current):
+            # follow_symlinks=False: avoid unbounded recursion if a symlink
+            # cycle is present under the cache root.
+            if not entry.is_dir(follow_symlinks=False):
                 continue
 
-            # Parse: gpu_block_size, gpu_blocks_per_file from dirname
-            block_params = parse_filemapper_params(
-                block_config_dir.name,
-                "block_size_{gpu_block_size}_blocks_per_file_{gpu_blocks_per_file}",
-            )
-            if not block_params:
-                continue  # Malformed directory name, skip
+            # Detect if this directory directly contains valid first-level hex buckets.
+            # We check if any of its subdirectories are valid hex buckets (e.g., len 2, 3, or 4).
+            is_hex_parent = False
+            for sub_entry in safe_scandir(entry.path):
+                if sub_entry.is_dir() and len(sub_entry.name) in (2, 3, 4) and hex_to_int(sub_entry.name) is not None:
+                    is_hex_parent = True
+                    break
 
-            gpu_block_size = block_params.get("gpu_block_size")
-            gpu_blocks_per_file = block_params.get("gpu_blocks_per_file")
+            if is_hex_parent:
+                yield entry
+            else:
+                stack.append(entry.path)
 
-            # Iterate through tp_*_pp_size_*_pcp_size_* directories
-            for parallel_config_dir in block_config_dir.glob(
-                "tp_*_pp_size_*_pcp_size_*"
-            ):
-                if not parallel_config_dir.is_dir():
+
+def is_dir_empty(dir_path: str) -> bool:
+    """Check if a directory is completely empty."""
+    try:
+        with os.scandir(dir_path) as entries:
+            for _ in entries:
+                return False
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def queue_folder(
+    folder_path: str,
+    folder_queue: Any,
+    on_empty_folder_discovered: Any,
+    min_age_seconds: float = 0.0,
+):
+    """Offer an empty folder to the background cleaner.
+
+    Skips folders modified within ``min_age_seconds`` to avoid racing a writer
+    that just created the directory and is about to populate it. The cleaner
+    only rmdir's empty directories, so this age guard is defense-in-depth on
+    top of that: it keeps freshly-created, about-to-be-written buckets out of
+    the cleanup queue entirely. A folder filtered out here is simply
+    re-evaluated on the next crawl sweep.
+    """
+    if min_age_seconds > 0.0:
+        try:
+            if time.time() - os.stat(folder_path).st_mtime < min_age_seconds:
+                return
+        except OSError:
+            # Vanished or unreadable - nothing to clean up.
+            return
+    if on_empty_folder_discovered:
+        on_empty_folder_discovered(folder_path)
+    if folder_queue is not None:
+        with contextlib.suppress(Exception):
+            folder_queue.put_nowait(folder_path)
+
+
+def stream_cache_files_with_mapper(
+    cache_path: Path,
+    hex_modulo_range: tuple[int, int] | None = None,
+    hex_bucket_len: int = 3,
+    on_empty_folder_discovered: Any = None,
+    folder_queue: Any = None,
+    dir_cleanup_ttl_seconds: float = 0.0,
+) -> Iterator[Path]:
+    """
+    Stream cache files under the collapsed FileMapper layout introduced in #585.
+
+    On-disk layout:
+        <root>/<safe_model_name>_<sha256-12>_r<rank>/<hex_bucket_len-chars>/<hh>_g<group_idx>/*.bin
+
+    The walker recognizes rank directories by the '_r<digits>' suffix, then
+    iterates the first-level hex bucket (hex_bucket_len hex chars), filters by
+    hex_modulo_range, and yields *.bin files from any second-level bucket
+    underneath (typically {hh}_g{group_idx}, but kept agnostic so we don't
+    depend on the group-index encoding).
+
+    Empty directories encountered along the way are offered to the folder
+    cleaner via folder_queue, subject to the dir_cleanup_ttl_seconds age guard.
+
+    Yields Path objects.
+    """
+    if not cache_path.exists():
+        logger.warning(f"cache_path does not exist: {cache_path}")
+        return
+
+    modulo_range_min, modulo_range_max = hex_modulo_range if hex_modulo_range else (0, HEX_MODULO_BASE - 1)
+
+    for rank_dir in _iter_rank_dirs(cache_path):
+        # If the rank directory itself is empty, queue it!
+        if is_dir_empty(rank_dir.path):
+            queue_folder(rank_dir.path, folder_queue, on_empty_folder_discovered, dir_cleanup_ttl_seconds)
+            continue
+
+        has_hex3_dirs = False
+        # Iterate first-level hex buckets (hex_bucket_len hex chars).
+        for hex3_dir in safe_scandir(rank_dir.path):
+            if not hex3_dir.is_dir() or len(hex3_dir.name) != hex_bucket_len:
+                continue
+            has_hex3_dirs = True
+
+            # If the hex3 directory itself is empty, queue it!
+            if is_dir_empty(hex3_dir.path):
+                queue_folder(hex3_dir.path, folder_queue, on_empty_folder_discovered, dir_cleanup_ttl_seconds)
+                continue
+
+            # Apply hex modulo filtering for load balancing across crawlers.
+            hex_int = hex_to_int(hex3_dir.name)
+            if hex_int is None:
+                continue
+            hex_mod = hex_int % HEX_MODULO_BASE
+            if not (modulo_range_min <= hex_mod <= modulo_range_max):
+                continue
+
+            has_hex2_dirs = False
+            # Iterate second-level buckets ({hh}_g{group_idx} or similar).
+            for hex2_dir in safe_scandir(hex3_dir.path):
+                if not hex2_dir.is_dir():
                     continue
+                has_hex2_dirs = True
 
-                # Parse: tp_size, pp_size, pcp_size from dirname
-                parallel_params = parse_filemapper_params(
-                    parallel_config_dir.name,
-                    "tp_{tp_size}_pp_size_{pp_size}_pcp_size_{pcp_size}",
-                )
-                if not parallel_params:
-                    continue  # Malformed directory name, skip
+                has_bin_files = False
+                for bin_file_entry in safe_scandir(hex2_dir.path):
+                    if bin_file_entry.is_file() and bin_file_entry.name.endswith(".bin"):
+                        has_bin_files = True
+                        yield Path(bin_file_entry.path)
 
-                tp_size = parallel_params.get("tp_size")
-                pp_size = parallel_params.get("pp_size")
-                pcp_size = parallel_params.get("pcp_size")
+                if not has_bin_files:
+                    queue_folder(hex2_dir.path, folder_queue, on_empty_folder_discovered, dir_cleanup_ttl_seconds)
 
-                # Iterate through rank_* directories
-                for rank_dir in parallel_config_dir.glob("rank_*"):
-                    if not rank_dir.is_dir():
-                        continue
+            if not has_hex2_dirs:
+                queue_folder(hex3_dir.path, folder_queue, on_empty_folder_discovered, dir_cleanup_ttl_seconds)
 
-                    # Parse: rank from dirname
-                    rank_match = re.match(r"rank_(\d+)", rank_dir.name)
-                    if not rank_match:
-                        continue  # Malformed directory name, skip
-
-                    rank = int(rank_match.group(1))
-
-                    # Iterate through dtype directories
-                    for dtype_dir in safe_scandir(str(rank_dir)):
-                        if not dtype_dir.is_dir():
-                            continue
-
-                        dtype = dtype_dir.name
-
-                        # Create FileMapper instance to get canonical base_path
-                        try:
-                            mapper = FileMapper(
-                                root_dir=str(cache_path),
-                                model_name=model_name,
-                                gpu_block_size=gpu_block_size,
-                                gpu_blocks_per_file=gpu_blocks_per_file,
-                                tp_size=tp_size,
-                                pp_size=pp_size,
-                                pcp_size=pcp_size,
-                                rank=rank,
-                                dtype=dtype,
-                            )
-
-                            # FileMapper.base_path is a string, convert to Path
-                            base_path = Path(mapper.base_path)
-                            if not base_path.exists():
-                                continue
-
-                        except Exception as e:
-                            # FileMapper initialization failed, skip this configuration
-                            logger.warning(
-                                f"FileMapper: Failed to create FileMapper for {model_name}: {e}"
-                            )
-                            continue
-
-                        # Iterate through hex folders (hhh) - first 3 hex digits
-                        for hex3_dir in safe_scandir(str(base_path)):
-                            if not hex3_dir.is_dir() or len(hex3_dir.name) != 3:
-                                continue
-
-                            # Apply hex modulo filtering for load balancing
-                            hex_int = hex_to_int(hex3_dir.name)
-                            if hex_int is not None and hex_modulo_range:
-                                hex_mod = hex_int % HEX_MODULO_BASE
-                                if not (
-                                    modulo_range_min <= hex_mod <= modulo_range_max
-                                ):
-                                    continue
-
-                            # Iterate through second hex level (hh) - next 2 hex digits
-                            for hex2_dir in safe_scandir(hex3_dir.path):
-                                if not hex2_dir.is_dir():
-                                    continue
-
-                                # Yield all .bin files
-                                for bin_file_entry in safe_scandir(hex2_dir.path):
-                                    if (
-                                        bin_file_entry.is_file()
-                                        and bin_file_entry.name.endswith(".bin")
-                                    ):
-                                        yield Path(bin_file_entry.path)
+        if not has_hex3_dirs:
+            queue_folder(rank_dir.path, folder_queue, on_empty_folder_discovered, dir_cleanup_ttl_seconds)
 
 
 def crawler_process(
     process_id: int,
-    hex_modulo_range: Tuple[int, int],
+    hex_modulo_range: tuple[int, int],
     cache_path: Path,
     config_dict: dict,
     deletion_event: multiprocessing.Event,
     file_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue,
     shutdown_event: multiprocessing.Event,
+    folder_queue: Any = None,
 ):
     """
     Crawler process (P1-PN): Discovers files and queues them for deletion.
@@ -286,35 +253,26 @@ def crawler_process(
     modulo_range_min, modulo_range_max = hex_modulo_range
     min_queue_size = config_dict["file_queue_min_size"]
     max_queue_size = config_dict["file_queue_maxsize"]
-    access_time_threshold_seconds = (
-        config_dict["file_access_time_threshold_minutes"] * MINUTES_TO_SECONDS
-    )
+    access_time_threshold_seconds = config_dict["file_access_time_threshold_minutes"] * MINUTES_TO_SECONDS
 
     # Convert decimal range to hex characters for clarity
     if modulo_range_min == modulo_range_max:
         hex_chars = f"'{format(modulo_range_min, 'x')}'"
     else:
-        hex_chars = (
-            f"'{format(modulo_range_min, 'x')}'-'{format(modulo_range_max, 'x')}'"
-        )
+        hex_chars = f"'{format(modulo_range_min, 'x')}'-'{format(modulo_range_max, 'x')}'"
 
     # Log crawler startup information
     logger.info(
-        f"Crawler P{process_num} started - hex %{HEX_MODULO_BASE} in [{modulo_range_min}, {modulo_range_max}] (hex: {hex_chars})"
+        f"Crawler P{process_num} started - hex %{HEX_MODULO_BASE} "
+        f"in [{modulo_range_min}, {modulo_range_max}] (hex: {hex_chars})"
     )
     logger.info(
         f"Crawler P{process_num} queue limits: MINQ={min_queue_size} (when OFF), MAXQ={max_queue_size} (when ON)"
     )
     logger.info(
-        f"Crawler P{process_num} hex_modulo_range: {hex_modulo_range[0]}-{hex_modulo_range[1]} (hex mod {HEX_MODULO_BASE})"
+        f"Crawler P{process_num} hex_modulo_range: "
+        f"{hex_modulo_range[0]}-{hex_modulo_range[1]} (hex mod {HEX_MODULO_BASE})"
     )
-
-    # Verify FileMapper is available
-    if not FILEMAPPER_AVAILABLE:
-        logger.error(
-            f"Crawler P{process_num} FileMapper not available - cannot proceed"
-        )
-        return
 
     logger.info(f"Crawler P{process_num} using FileMapper cache structure")
 
@@ -322,6 +280,7 @@ def crawler_process(
     files_queued = 0
     files_skipped = 0
     files_skipped_stat_error = 0
+    empty_folders_queued = 0
     stat_error_samples = []  # Store first few stat errors for logging
     max_stat_error_samples = 3
     last_stats_send_time = time.time()
@@ -333,10 +292,24 @@ def crawler_process(
         except Exception:
             return 0
 
+    def on_empty_folder(*args, **kwargs):
+        # Counts empty dirs this crawler discovered and handed to the folder
+        # cleaner; the cleaner performs the actual rmdir.
+        nonlocal empty_folders_queued
+        empty_folders_queued += 1
+
     try:
         while not shutdown_event.is_set():
             # Stream files from assigned hex range using FileMapper
-            file_stream = stream_cache_files_with_mapper(cache_path, hex_modulo_range)
+            hex_bucket_len = config_dict.get("hex_bucket_len", 3)
+            file_stream = stream_cache_files_with_mapper(
+                cache_path,
+                hex_modulo_range,
+                hex_bucket_len=hex_bucket_len,
+                on_empty_folder_discovered=on_empty_folder,
+                folder_queue=folder_queue,
+                dir_cleanup_ttl_seconds=config_dict.get("dir_cleanup_ttl_seconds", 0.0),
+            )
 
             for file_path in file_stream:
                 files_discovered += 1
@@ -359,9 +332,7 @@ def crawler_process(
                     files_skipped_stat_error += 1
                     # Log first few errors with details for diagnostics
                     if len(stat_error_samples) < max_stat_error_samples:
-                        stat_error_samples.append(
-                            f"{file_path}: {type(e).__name__}: {e}"
-                        )
+                        stat_error_samples.append(f"{file_path}: {type(e).__name__}: {e}")
                     continue
 
                 # Determine target queue size based on deletion state
@@ -383,7 +354,9 @@ def crawler_process(
                         # Queue is pre-filled - just discover, don't queue
                         if files_discovered % DISCOVERY_LOG_INTERVAL == 0:
                             logger.debug(
-                                f"Crawler P{process_num} pre-fill complete: queue={queue_size}/{target_size}, discovered={files_discovered}"
+                                f"Crawler P{process_num} pre-fill complete: "
+                                f"queue={queue_size}/{target_size}, "
+                                f"discovered={files_discovered}"
                             )
                         continue
 
@@ -398,14 +371,13 @@ def crawler_process(
                         deletion_state = "ON" if deletion_event.is_set() else "OFF"
                         logger.debug(
                             f"Queued {files_queued} files "
-                            f"(discovered {files_discovered}, queue={queue_size}/{target_size}, deletion={deletion_state})"
+                            f"(discovered {files_discovered}, "
+                            f"queue={queue_size}/{target_size}, "
+                            f"deletion={deletion_state})"
                         )
 
                     # Log every N files discovered (even if not queued)
-                    if (
-                        files_discovered % DISCOVERY_LOG_INTERVAL == 0
-                        and files_discovered > 0
-                    ):
+                    if files_discovered % DISCOVERY_LOG_INTERVAL == 0 and files_discovered > 0:
                         queue_size = get_queue_size()
                         deletion_state = "ON" if deletion_event.is_set() else "OFF"
                         logger.debug(
@@ -430,6 +402,7 @@ def crawler_process(
                     "files_queued": files_queued,
                     "files_skipped": files_skipped,
                     "files_skipped_stat_error": files_skipped_stat_error,
+                    "empty_folders_queued": empty_folders_queued,
                     "queue_size": queue_size,
                     "deletion_active": deletion_event.is_set(),
                 },
@@ -437,9 +410,11 @@ def crawler_process(
             )
 
     except Exception as e:
-        logger.error(f"Crawler P{process_num} error: {e}", exc_info=True)
+        logger.exception(f"Crawler P{process_num} error: {e}")
     finally:
         logger.info(
-            f"Crawler P{process_num} stopping - discovered {files_discovered}, queued {files_queued}, "
-            f"skipped {files_skipped} (access_time), skipped_stat_error {files_skipped_stat_error}"
+            f"Crawler P{process_num} stopping - discovered {files_discovered}, "
+            f"queued {files_queued}, skipped {files_skipped} (access_time), "
+            f"skipped_stat_error {files_skipped_stat_error}, "
+            f"queued {empty_folders_queued} empty folders for cleanup"
         )

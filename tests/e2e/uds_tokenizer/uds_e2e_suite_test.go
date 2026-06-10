@@ -1,5 +1,3 @@
-//go:build !embedded_tokenizers
-
 /*
 Copyright 2026 The llm-d Authors.
 
@@ -26,8 +24,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/go-logr/logr/testr"
+	container "github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -110,15 +108,17 @@ func (s *UDSTokenizerSuite) SetupTest() {
 	s.config, err = kvcache.NewDefaultConfig()
 	s.Require().NoError(err)
 
-	// Configure UDS tokenizer to use TCP for testing
-	s.config.TokenizersPoolConfig.ModelName = defaultModelName
-	s.config.TokenizersPoolConfig.UdsTokenizerConfig = &tokenization.UdsTokenizerConfig{
+	tokenizerPoolConfig, err := tokenization.DefaultConfig()
+	s.Require().NoError(err)
+	tokenizerPoolConfig.ModelName = defaultModelName
+	tokenizerPoolConfig.UdsTokenizerConfig = &tokenization.UdsTokenizerConfig{
 		SocketFile: s.grpcAddress,
 		UseTCP:     true,
 	}
+	s.config.TokenizersPoolConfig = tokenizerPoolConfig
 
 	s.tokenProcessorConfig = kvblock.DefaultTokenProcessorConfig()
-	s.tokenProcessorConfig.BlockSize = 4
+	s.tokenProcessorConfig.BlockSizeTokens = 4
 	s.tokenProcessor, err = kvblock.NewChunkedTokenDatabase(s.tokenProcessorConfig)
 	s.Require().NoError(err)
 
@@ -158,10 +158,12 @@ func (s *UDSTokenizerSuite) TearDownSuite() {
 func (s *UDSTokenizerSuite) promptToEngineAndRequestKeys(
 	tokens []uint32,
 ) (engineKeys, requestKeys []kvblock.BlockHash) {
-	requestKeys = s.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, defaultModelName)
+	requestKeys, err := s.tokenProcessor.TokensToKVBlockKeys(kvblock.EmptyBlockHash, tokens, defaultModelName, nil)
+	s.Require().NoError(err)
 	s.Require().NotEmpty(requestKeys)
 
-	engineKeys = s.tokenProcessor.TokensToKVBlockKeys(kvblock.BlockHash(1), tokens, defaultModelName)
+	engineKeys, err = s.tokenProcessor.TokensToKVBlockKeys(kvblock.BlockHash(1), tokens, defaultModelName, nil)
+	s.Require().NoError(err)
 	s.Require().NotEmpty(engineKeys)
 
 	return engineKeys, requestKeys
