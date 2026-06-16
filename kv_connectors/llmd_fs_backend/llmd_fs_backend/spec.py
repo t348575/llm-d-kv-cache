@@ -75,6 +75,22 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         )
         self.gpu_blocks_per_file = self.offloaded_block_size // self.hash_block_size
 
+        # The parent OffloadingSpec only derives block_size_factor from
+        # extra_config["block_size"]; when that key is absent it stays 1. A
+        # factor of 1 makes the scheduler emit one offload key per GPU block,
+        # which desyncs the offload-key -> file mapping from the worker and
+        # FileMapper (both group gpu_blocks_per_file GPU blocks into one file).
+        # Force it so the scheduler's offloaded block size matches ours.
+        gpu_block_sizes = set(self.gpu_block_size)
+        assert len(gpu_block_sizes) == 1, (
+            "all KV cache groups must share a single GPU block size"
+        )
+        single_gpu_block_size = gpu_block_sizes.pop()
+        assert self.offloaded_block_size % single_gpu_block_size == 0, (
+            "offloaded_block_size must be a multiple of the GPU block size"
+        )
+        self.block_size_factor = self.offloaded_block_size // single_gpu_block_size
+
         self.read_preferring_ratio = float(
             self.extra_config.get(
                 "read_preferring_ratio", DEFAULT_READ_PREFERRING_WORKERS_RATIO

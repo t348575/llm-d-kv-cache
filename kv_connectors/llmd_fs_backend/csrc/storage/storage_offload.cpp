@@ -62,7 +62,8 @@ StorageOffloadEngine::StorageOffloadEngine(
     std::vector<int64_t> per_group_block_bytes,
     int read_preferring_workers,
     const std::string& gds_mode_str,
-    float max_write_queued_seconds)
+    float max_write_queued_seconds,
+    bool use_odirect)
     : m_tensor_copier(tensors, group_tensor_indices, gpu_blocks_per_file),
       m_gds_mode(parse_gds_mode(gds_mode_str)),
       m_thread_pool(
@@ -71,7 +72,8 @@ StorageOffloadEngine::StorageOffloadEngine(
           get_device_id(),
           read_preferring_workers),
       m_gpu_blocks_per_file(gpu_blocks_per_file),
-      m_max_write_queued_seconds(max_write_queued_seconds) {
+      m_max_write_queued_seconds(max_write_queued_seconds),
+      m_use_odirect(use_odirect) {
   init_handlers(m_gds_mode, tensors);
 }
 
@@ -136,10 +138,10 @@ void StorageOffloadEngine::init_handlers(
 
   m_read_handler = (gds_io && gds_io->use_for_read())
                        ? std::shared_ptr<StorageHandler>(gds_io)
-                       : std::make_shared<FileIO>(m_tensor_copier);
+                       : std::make_shared<FileIO>(m_tensor_copier, m_use_odirect);
   m_write_handler = (gds_io && gds_io->use_for_write())
                         ? std::shared_ptr<StorageHandler>(gds_io)
-                        : std::make_shared<FileIO>(m_tensor_copier);
+                        : std::make_shared<FileIO>(m_tensor_copier, m_use_odirect);
 
   auto mode_str = [](StorageMode m) {
     switch (m) {

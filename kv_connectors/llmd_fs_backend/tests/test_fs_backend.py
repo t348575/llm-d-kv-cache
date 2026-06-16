@@ -464,3 +464,54 @@ def test_fs_backend_roundtrip_param(
         gpu_blocks_per_file=gpu_blocks_per_file,
         threads_per_gpu=threads_per_gpu,
     )
+
+
+@pytest.mark.parametrize("gpu_blocks_per_file", [1, 4])
+def test_fs_backend_roundtrip_odirect(gpu_blocks_per_file: int, default_vllm_config):
+    """O_DIRECT round-trip: writing and reading with use_odirect=True must
+    restore blocks bit-exactly. With Llama-style shapes the per-block byte
+    size is sector-aligned, so this exercises the O_DIRECT fast path; on
+    unaligned filesystems/shapes it falls back to buffered I/O, which must
+    still bit-match.
+    """
+    model_name = "llama3-70b"
+    tp_size = 1
+    tp_rank = 0
+    dtype = torch.float16
+    root_dir = TMP_DIR
+    num_layers = 80
+    block_size = 16
+    num_heads = 64
+    head_size = 128
+    num_blocks = 8
+    write_block_ids = list(range(num_blocks))
+    read_block_ids = list(range(num_blocks))
+    threads_per_gpu = 8
+    gpu_block_size = 16
+    file_mapper = FileMapper(
+        root_dir=root_dir,
+        model_name=model_name,
+        hash_block_size=gpu_block_size,
+        gpu_blocks_per_file=gpu_blocks_per_file,
+        tp_size=tp_size,
+        pp_size=tp_size,
+        pcp_size=tp_size,
+        dcp_size=1,
+        rank=tp_rank,
+        dtype=str(dtype),
+    )
+    roundtrip_once(
+        file_mapper=file_mapper,
+        num_layers=num_layers,
+        dtype=dtype,
+        num_blocks=num_blocks,
+        block_size=block_size,
+        gpu_block_size=gpu_block_size,
+        num_heads=num_heads,
+        head_size=head_size,
+        read_block_ids=read_block_ids,
+        write_block_ids=write_block_ids,
+        gpu_blocks_per_file=gpu_blocks_per_file,
+        threads_per_gpu=threads_per_gpu,
+        extra_config={"use_odirect": True},
+    )

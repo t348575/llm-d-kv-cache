@@ -28,7 +28,8 @@
 // CPU File I/O class - uses CPU buffer for staging
 class FileIO : public StorageHandler {
  public:
-  FileIO(TensorCopier& tensor_copier) : m_tensor_copier(tensor_copier) {}
+  FileIO(TensorCopier& tensor_copier, bool use_odirect = false)
+      : m_tensor_copier(tensor_copier), m_use_odirect(use_odirect) {}
   ~FileIO() override = default;
 
   // Write blocks to file using CPU staging
@@ -54,6 +55,10 @@ class FileIO : public StorageHandler {
 
  private:
   TensorCopier& m_tensor_copier;
+  // When true, write/read via O_DIRECT to bypass the page cache. O_DIRECT is
+  // best-effort: it is only used when buffer pointer, transfer size and file
+  // offset are all sector-aligned, otherwise the buffered path is used.
+  bool m_use_odirect;
 
   // Write the staging buffer to file (via temp file + atomic rename),
   // with partial-write support: persists only `write_size` bytes starting
@@ -62,7 +67,8 @@ class FileIO : public StorageHandler {
   static bool write_buffer_to_file(const StagingBufferInfo& buf,
                                    const std::string& target_path,
                                    size_t write_offset,
-                                   size_t write_size);
+                                   size_t write_size,
+                                   bool use_odirect);
 
   // Read from file into the staging buffer, with partial-read support:
   // reads the last `blocks_in_file` blocks (each `bytes_per_block` bytes)
@@ -72,5 +78,6 @@ class FileIO : public StorageHandler {
                                     StagingBufferInfo& buf,
                                     size_t buf_offset,
                                     size_t bytes_per_block,
-                                    size_t blocks_in_file);
+                                    size_t blocks_in_file,
+                                    bool use_odirect);
 };

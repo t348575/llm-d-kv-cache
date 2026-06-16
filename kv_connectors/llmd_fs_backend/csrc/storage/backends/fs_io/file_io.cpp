@@ -17,9 +17,11 @@
 #include <filesystem>
 #include <fstream>
 #include <vector>
+#include <cstdint>
 #include <cstring>
 #include <cerrno>
 #include <fcntl.h>
+#include <unistd.h>
 #include <sys/stat.h>
 #include <cuda_runtime.h>
 #include <random>
@@ -37,12 +39,21 @@ namespace fs = std::filesystem;
 // Define a larger buffer (1MB) to reduce syscall overhead and speed up I/O
 const size_t WRITE_BUFFER_SIZE = 1 * 1024 * 1024;  // 1MB buffer
 
+// O_DIRECT alignment requirement (512 bytes covers all common block sizes).
+const size_t DIRECT_IO_ALIGN = 512;
+
 // Allocate custom I/O buffer for this thread (replaces small default buffer)
 thread_local std::vector<char> thread_write_buffer(WRITE_BUFFER_SIZE);
 
 // Thread-local unique suffix for temporary files
 thread_local std::string tmp_file_suffix =
     "_" + std::to_string(std::random_device{}()) + ".tmp";
+
+// True when ptr, offset and size all satisfy O_DIRECT's sector alignment.
+static inline bool odirect_aligned(const void* ptr, size_t offset, size_t size) {
+  return (reinterpret_cast<uintptr_t>(ptr) % DIRECT_IO_ALIGN == 0) &&
+         (offset % DIRECT_IO_ALIGN == 0) && (size % DIRECT_IO_ALIGN == 0);
+}
 // -------------------------------------------------------------------
 // file-IO Functions
 // -------------------------------------------------------------------
@@ -50,7 +61,8 @@ thread_local std::string tmp_file_suffix =
 bool FileIO::write_buffer_to_file(const StagingBufferInfo& buf,
                                   const std::string& target_path,
                                   size_t write_offset,
-                                  size_t write_size) {
+                                  size_t write_size,
+                                  bool use_odirect) {
   if (!buf.ptr || write_offset + write_size > buf.size) {
     FS_LOG_ERROR("write_buffer_to_file: bad range for "
                  << target_path << " (offset=" << write_offset
@@ -71,6 +83,37 @@ bool FileIO::write_buffer_to_file(const StagingBufferInfo& buf,
   // Include tmp_file_suffix so each thread uses a unique temporary file
   std::string tmp_path = target_path + tmp_file_suffix;
 
+  const char* src = reinterpret_cast<const char*>(buf.ptr) + write_offset;
+
+  // Fast path: O_DIRECT bypasses the page cache. Only taken when the slice is
+  // sector-aligned; falls through to buffered I/O otherwise so correctness
+  // never depends on the model's block byte size.
+  if (use_odirect && odirect_aligned(src, write_offset, write_size)) {
+    int fd =
+        open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    if (fd >= 0) {
+      ssize_t written = ::write(fd, src, write_size);
+      ::close(fd);
+      if (written != static_cast<ssize_t>(write_size)) {
+        FS_LOG_ERROR("O_DIRECT write failed: "
+                     << tmp_path << " (wrote " << written << "/" << write_size
+                     << " bytes) - " << std::strerror(errno));
+        std::remove(tmp_path.c_str());
+        return false;
+      }
+      if (std::rename(tmp_path.c_str(), target_path.c_str()) != 0) {
+        FS_LOG_ERROR("Failed to rename " << tmp_path << " to " << target_path
+                                         << " - " << std::strerror(errno));
+        std::remove(tmp_path.c_str());
+        return false;
+      }
+      return true;
+    }
+    // O_DIRECT not supported by this filesystem — fall back to buffered.
+    FS_LOG_WARN("O_DIRECT open failed for " << tmp_path << " ("
+                << std::strerror(errno) << "), falling back to buffered write");
+  }
+
   std::ofstream ofs(tmp_path, std::ios::out | std::ios::binary);
   if (!ofs) {
     FS_LOG_ERROR("Failed to open temporary file for writing: "
@@ -82,7 +125,7 @@ bool FileIO::write_buffer_to_file(const StagingBufferInfo& buf,
   ofs.rdbuf()->pubsetbuf(thread_write_buffer.data(), WRITE_BUFFER_SIZE);
 
   // Write only the actual data region of the staging buffer.
-  ofs.write(reinterpret_cast<const char*>(buf.ptr) + write_offset, write_size);
+  ofs.write(src, write_size);
   if (!ofs) {
     FS_LOG_ERROR("Failed to write to temporary file: " << tmp_path << " - "
                                                        << std::strerror(errno));
@@ -113,7 +156,60 @@ bool FileIO::read_buffer_from_file(const std::string& path,
                                    StagingBufferInfo& buf,
                                    size_t buf_offset,
                                    size_t bytes_per_block,
-                                   size_t blocks_in_file) {
+                                   size_t blocks_in_file,
+                                   bool use_odirect) {
+  size_t read_size = blocks_in_file * bytes_per_block;
+  char* dst = reinterpret_cast<char*>(buf.ptr) + buf_offset;
+
+  // Bounds check destination buffer.
+  if (!buf.ptr || buf.size < buf_offset + read_size) {
+    FS_LOG_ERROR("Staging buffer too small for file: "
+                 << path << " (buf_offset=" << buf_offset
+                 << " required=" << read_size << " available=" << buf.size
+                 << " ptr=" << buf.ptr << ")");
+    return false;
+  }
+
+  // Fast path: O_DIRECT pread at the file tail. stat() gives the size without
+  // a buffered open. Only taken when file size, offset and slice are all
+  // sector-aligned; otherwise falls through to buffered I/O.
+  if (use_odirect) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) {
+      FS_LOG_ERROR("O_DIRECT: stat failed: " << path << " - "
+                                             << std::strerror(errno));
+      return false;
+    }
+    size_t file_size = static_cast<size_t>(st.st_size);
+    if (file_size < read_size) {
+      FS_LOG_ERROR("File too small: " << path << " (file_size=" << file_size
+                                      << " required=" << read_size << ")");
+      return false;
+    }
+    size_t file_offset = file_size - read_size;
+    if (odirect_aligned(dst, buf_offset, read_size) &&
+        (file_offset % DIRECT_IO_ALIGN == 0) &&
+        (file_size % DIRECT_IO_ALIGN == 0)) {
+      int fd = open(path.c_str(), O_RDONLY | O_DIRECT);
+      if (fd >= 0) {
+        ssize_t bytes_read =
+            pread(fd, dst, read_size, static_cast<off_t>(file_offset));
+        ::close(fd);
+        if (bytes_read != static_cast<ssize_t>(read_size)) {
+          FS_LOG_ERROR("O_DIRECT read failed: "
+                       << path << " (read " << bytes_read << "/" << read_size
+                       << " bytes from offset " << file_offset << ") - "
+                       << std::strerror(errno));
+          return false;
+        }
+        return true;
+      }
+      // O_DIRECT not supported — fall back to buffered.
+      FS_LOG_WARN("O_DIRECT open failed for " << path << " ("
+                  << std::strerror(errno) << "), falling back to buffered read");
+    }
+  }
+
   // Open file and grab its size in one pass (ios::ate).
   std::ifstream ifs(path, std::ios::in | std::ios::binary | std::ios::ate);
   if (!ifs) {
@@ -128,7 +224,6 @@ bool FileIO::read_buffer_from_file(const std::string& path,
   size_t file_size = static_cast<size_t>(end_pos);
 
   // File must hold at least the blocks the caller is asking for.
-  size_t read_size = blocks_in_file * bytes_per_block;
   if (file_size < read_size) {
     FS_LOG_ERROR("File too small: " << path << " (file_size=" << file_size
                                     << " required=" << read_size << ")");
@@ -138,18 +233,8 @@ bool FileIO::read_buffer_from_file(const std::string& path,
   size_t file_offset = file_size - read_size;
   ifs.seekg(static_cast<std::streamoff>(file_offset), std::ios::beg);
 
-  // Bounds check destination buffer.
-  if (!buf.ptr || buf.size < buf_offset + read_size) {
-    FS_LOG_ERROR("Staging buffer too small for file: "
-                 << path << " (buf_offset=" << buf_offset
-                 << " required=" << read_size << " available=" << buf.size
-                 << " ptr=" << buf.ptr << ")");
-    return false;
-  }
-
   // Read file into Staging buffer
-  ifs.read(reinterpret_cast<char*>(buf.ptr) + buf_offset,
-           static_cast<std::streamsize>(read_size));
+  ifs.read(dst, static_cast<std::streamsize>(read_size));
   std::streamsize bytes_read = ifs.gcount();
   if (bytes_read != static_cast<std::streamsize>(read_size) || !ifs.good()) {
     FS_LOG_ERROR("Failed to read file: "
@@ -203,13 +288,13 @@ bool FileIO::write_blocks_to_file(const std::string& dst_file,
   size_t blocks_in_file = block_ids.size();
   size_t write_offset = static_cast<size_t>(head_offset) * bytes_per_block;
   size_t write_size = blocks_in_file * bytes_per_block;
-  bool success =
-      TIME_EXPR("write phase 2: write_buffer_to_file",
-                write_buffer_to_file(buf, dst_file, write_offset, write_size),
-                "file:",
-                dst_file,
-                " size:",
-                write_size);
+  bool success = TIME_EXPR(
+      "write phase 2: write_buffer_to_file",
+      write_buffer_to_file(buf, dst_file, write_offset, write_size, m_use_odirect),
+      "file:",
+      dst_file,
+      " size:",
+      write_size);
 
   if (!success) {
     FS_LOG_ERROR(
@@ -239,7 +324,8 @@ bool FileIO::read_blocks_from_file(const std::string& src_file,
                                                  buf,
                                                  buf_offset,
                                                  bytes_per_block,
-                                                 blocks_in_file),
+                                                 blocks_in_file,
+                                                 m_use_odirect),
                            "file:",
                            src_file);
   if (!success) {

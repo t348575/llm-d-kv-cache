@@ -24,6 +24,7 @@ dependencies = [
     "nixl",
     "msgpack",
     "pyzmq",
+    "simple-profiler",
 ]
 
 [tool.setuptools]

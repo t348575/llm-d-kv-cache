@@ -71,6 +71,9 @@ class StorageOffloadEngine {
   std::atomic<uint64_t> m_avg_write_duration_us{0};
   // Max seconds of queued writes before dropping (0 = disabled)
   float m_max_write_queued_seconds;
+  // When true, the CPU FileIO handler uses O_DIRECT (best-effort) to bypass
+  // the page cache. Ignored by the GDS handler.
+  bool m_use_odirect;
   // Counter of dropped writes (for rate-limited logging)
   size_t m_dropped_writes{0};
   // Calculate staging buffer size in bytes.
@@ -101,7 +104,8 @@ class StorageOffloadEngine {
                        std::vector<int64_t> per_group_block_bytes,
                        int read_preferring_workers,
                        const std::string& gds_mode,
-                       float max_write_queued_seconds = 10.0);
+                       float max_write_queued_seconds = 10.0,
+                       bool use_odirect = false);
   // Return finished jobs and their success status
   std::vector<std::pair<int, bool>> get_finished();
   // Update EMA of per-file write duration (called by write workers)

@@ -18,6 +18,7 @@ import time
 from typing import Protocol, runtime_checkable
 
 import storage_offload
+from simple_profiler import profiler
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -103,11 +104,18 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
         self.transfer_type = transfer_type
         self.per_group_block_bytes = per_group_block_bytes
 
-        # Maps job_id -> (submit_time, transfer_size_bytes).
-        # Shared across handlers via StorageOffloadingHandlers.
-        self._pending_jobs: dict[int, tuple[float, int]] = {}
+        # Maps job_id -> (submit_time, transfer_size_bytes, profile_tid,
+        # req_id, submit_ns). Shared across handlers via
+        # StorageOffloadingHandlers.
+        self._pending_jobs: dict[int, tuple[float, int, str, str, int]] = {}
 
-    def _record_job(self, job_id: int, transfer_size_bytes: int):
+    def _record_job(
+        self,
+        job_id: int,
+        transfer_size_bytes: int,
+        profile_tid: str,
+        req_id: str,
+    ):
         """Record job submission metadata for metrics.
 
         Args:
@@ -115,10 +123,16 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
                 transfer for this job — caller computes it from the actual
                 (group, blocks_per_file) it is submitting, not from a
                 global per-block estimate.
+            profile_tid: Profiler track ID supplied by the vLLM offloading
+                worker; ties the storage-layer event to the request's trace.
+            req_id: Request ID for profiler event annotation.
         """
         self._pending_jobs[job_id] = (
             time.monotonic(),
             transfer_size_bytes,
+            profile_tid,
+            req_id,
+            time.perf_counter_ns(),
         )
 
     def get_finished(self) -> list[TransferResult]:
@@ -129,11 +143,12 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
             List of completed transfer results.
         """
         now = time.monotonic()
+        now_ns = time.perf_counter_ns()
         results = []
         for job_id, success in self.engine.get_finished():
             job_info = self._pending_jobs.pop(job_id, None)
             if job_info is not None:
-                submit_time, transfer_size = job_info
+                submit_time, transfer_size, profile_tid, req_id, submit_ns = job_info
                 transfer_time = now - submit_time
                 results.append(
                     TransferResult(
@@ -144,6 +159,25 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
                         transfer_type=self.transfer_type,
                     )
                 )
+                # Emit a storage-layer transfer span into the request's trace.
+                # vLLM emits the connector-level load/save e2e events; this adds
+                # the fs_backend's own submit->complete span (queue + I/O time
+                # at the storage tier). Guarded so it is free when profiling off.
+                if profiler._active:
+                    direction = f"{self.transfer_type[0]}->{self.transfer_type[1]}"
+                    profiler.add_event(
+                        name=f"fs_offload_transfer(job={job_id})",
+                        category="kv_offload",
+                        start_ns=submit_ns,
+                        duration_ns=now_ns - submit_ns,
+                        tid=profile_tid,
+                        args={
+                            "req_id": req_id,
+                            "direction": direction,
+                            "size_bytes": transfer_size,
+                            "success": success,
+                        },
+                    )
                 logger.debug(
                     "Transfer finished: job_id=%d status=%s "
                     "size=%.2f [MB] time=%.3f [s] throughput=%.2f [GB/s] type=%s",
@@ -326,7 +360,13 @@ class BaseStorageOffloadingHandler(OffloadingHandler):
 class GPUToStorageHandler(BaseStorageOffloadingHandler):
     """Handler for GPU -> Storage (PUT) transfers."""
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(
+        self,
+        job_id: int,
+        spec: TransferSpec,
+        profile_tid: str = "kv_store",
+        req_id: str = "",
+    ) -> bool:
         """Launch an asynchronous transfer GPU -> Storage."""
         src_spec, dst_spec = spec
         assert isinstance(src_spec, GPULoadStoreSpec)
@@ -361,14 +401,20 @@ class GPUToStorageHandler(BaseStorageOffloadingHandler):
             job_id, group_indices, dst_files, per_file_block_ids, head_offsets
         )
         if success:
-            self._record_job(job_id, total_bytes)
+            self._record_job(job_id, total_bytes, profile_tid, req_id)
         return success
 
 
 class StorageToGPUHandler(BaseStorageOffloadingHandler):
     """Handler for asynchronous transfers from storage to GPU."""
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(
+        self,
+        job_id: int,
+        spec: TransferSpec,
+        profile_tid: str = "kv_load",
+        req_id: str = "",
+    ) -> bool:
         """Launch an asynchronous transfer Storage -> GPU."""
         src_spec, dst_spec = spec
         assert isinstance(src_spec, SharedStorageLoadStoreSpec)
@@ -399,7 +445,7 @@ class StorageToGPUHandler(BaseStorageOffloadingHandler):
             job_id, group_indices, src_files, per_file_block_ids, head_offsets
         )
         if success:
-            self._record_job(job_id, total_bytes)
+            self._record_job(job_id, total_bytes, profile_tid, req_id)
         return success
 
 
@@ -506,7 +552,7 @@ class StorageOffloadingHandlers:
         )
 
         # Shared across both handlers since the engine has a single completion queue.
-        pending_jobs: dict[int, tuple[float, int, TransferType]] = {}
+        pending_jobs: dict[int, tuple[float, int, str, str, int]] = {}
 
         self.gpu_to_storage_handler = GPUToStorageHandler(
             engine=self.engine,
@@ -567,6 +613,7 @@ class StorageOffloadingHandlers:
         per_group_block_bytes = [
             sum(ref.page_size_bytes for ref in g) for g in kv_caches.group_data_refs
         ]
+        use_odirect = bool(extra_config.get("use_odirect", False))
         return storage_offload.StorageOffloadEngine(
             io_threads,
             gpu_blocks_per_file,
@@ -576,4 +623,5 @@ class StorageOffloadingHandlers:
             read_preferring_workers,
             gds_mode,
             max_write_queued_seconds,
+            use_odirect,
         )
