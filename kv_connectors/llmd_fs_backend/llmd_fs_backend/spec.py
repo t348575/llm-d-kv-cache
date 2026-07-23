@@ -73,7 +73,6 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
         assert self.offloaded_block_size % self.hash_block_size == 0, (
             "offloaded_block_size must be a multiple of hash_block_size"
         )
-        self.gpu_blocks_per_file = self.offloaded_block_size // self.hash_block_size
 
         # The parent OffloadingSpec only derives block_size_factor from
         # extra_config["block_size"]; when that key is absent it stays 1. A
@@ -90,6 +89,10 @@ class SharedStorageOffloadingSpec(OffloadingSpec):
             "offloaded_block_size must be a multiple of the GPU block size"
         )
         self.block_size_factor = self.offloaded_block_size // single_gpu_block_size
+        # GPULoadStoreSpec group sizes and block indices are expressed in GPU
+        # blocks, so file grouping must use the same unit. hash_block_size can
+        # be smaller than the GPU block size for hybrid models.
+        self.gpu_blocks_per_file = self.block_size_factor
 
         self.read_preferring_ratio = float(
             self.extra_config.get(
